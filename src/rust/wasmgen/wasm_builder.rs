@@ -1031,7 +1031,9 @@ impl WasmBuilder {
     pub fn call_fn1_i64(&mut self, name: &str) { self.call_fn(name, FunctionType::FN1_I64) }
     #[allow(dead_code)]
     pub fn call_fn2_i64_i64(&mut self, name: &str) { self.call_fn(name, FunctionType::FN2_I64_I64) }
-    pub fn call_fn3_i32_i32_i64(&mut self, name: &str) { self.call_fn(name, FunctionType::FN3_I32_I32_I64) }
+    pub fn call_fn3_i32_i32_i64(&mut self, name: &str) {
+        self.call_fn(name, FunctionType::FN3_I32_I32_I64)
+    }
     pub fn call_fn1_ret(&mut self, name: &str) { self.call_fn(name, FunctionType::FN1_RET) }
     pub fn call_fn1_ret_i64(&mut self, name: &str) { self.call_fn(name, FunctionType::FN1_RET_I64) }
     pub fn call_fn1_f32_ret(&mut self, name: &str) { self.call_fn(name, FunctionType::FN1_F32_RET) }

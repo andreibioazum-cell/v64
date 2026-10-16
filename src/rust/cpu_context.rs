@@ -110,8 +110,29 @@ impl CpuContext {
 
     pub fn rex_w(&self) -> bool { self.prefixes & PREFIX_REX_W != 0 }
     /// register number extensions (8 or 0), as folded into register numbers by the decoder
-    pub fn rex_r(&self) -> u32 { if self.prefixes & PREFIX_REX_R != 0 { 8 } else { 0 } }
-    pub fn rex_x(&self) -> u32 { if self.prefixes & PREFIX_REX_X != 0 { 8 } else { 0 } }
-    pub fn rex_b(&self) -> u32 { if self.prefixes & PREFIX_REX_B != 0 { 8 } else { 0 } }
+    pub fn rex_r(&self) -> u32 {
+        if self.prefixes & PREFIX_REX_R != 0 {
+            8
+        }
+        else {
+            0
+        }
+    }
+    pub fn rex_x(&self) -> u32 {
+        if self.prefixes & PREFIX_REX_X != 0 {
+            8
+        }
+        else {
+            0
+        }
+    }
+    pub fn rex_b(&self) -> u32 {
+        if self.prefixes & PREFIX_REX_B != 0 {
+            8
+        }
+        else {
+            0
+        }
+    }
     pub fn ssize_32(&self) -> bool { self.state_flags.ssize_32() }
 }

@@ -521,7 +521,10 @@ pub unsafe fn instr32_5A() { write_reg32(2 + rex_b(), return_on_pagefault!(pop32
 pub unsafe fn instr16_5B() { write_reg16(3 + rex_b(), return_on_pagefault!(pop16())); }
 pub unsafe fn instr32_5B() { write_reg32(3 + rex_b(), return_on_pagefault!(pop32s())); }
 pub unsafe fn instr16_5C() {
-    write_reg16(4 + rex_b(), return_on_pagefault!(safe_read16(get_stack_pointer(0))));
+    write_reg16(
+        4 + rex_b(),
+        return_on_pagefault!(safe_read16(get_stack_pointer(0))),
+    );
 }
 pub unsafe fn instr32_5C() {
     write_reg32(
@@ -1431,15 +1434,13 @@ pub unsafe fn instr32_C8(size: i32, nesting: i32) { enter32(size, nesting); }
 pub unsafe fn instr16_C9() {
     // leave
     let old_vbp = if *stack_size_32 { read_reg32(EBP) } else { read_reg16(BP) };
-    let new_bp =
-        return_on_pagefault!(safe_read16((get_seg_ss() + old_vbp) as u32 as u64));
+    let new_bp = return_on_pagefault!(safe_read16((get_seg_ss() + old_vbp) as u32 as u64));
     set_stack_reg(old_vbp + 2);
     write_reg16(BP, new_bp);
 }
 pub unsafe fn instr32_C9() {
     let old_vbp = if *stack_size_32 { read_reg32(EBP) } else { read_reg16(BP) };
-    let new_ebp =
-        return_on_pagefault!(safe_read32s((get_seg_ss() + old_vbp) as u32 as u64));
+    let new_ebp = return_on_pagefault!(safe_read32s((get_seg_ss() + old_vbp) as u32 as u64));
     set_stack_reg(old_vbp + 4);
     write_reg32(EBP, new_ebp);
 }
@@ -1684,8 +1685,8 @@ pub unsafe fn instr_D7() {
         write_reg8(
             AL,
             return_on_pagefault!(safe_read8(
-                (return_on_pagefault!(get_seg_prefix(DS)) + read_reg32(EBX) + read_reg8(AL))
-                    as u32 as u64,
+                (return_on_pagefault!(get_seg_prefix(DS)) + read_reg32(EBX) + read_reg8(AL)) as u32
+                    as u64,
             )),
         )
     }

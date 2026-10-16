@@ -14,9 +14,9 @@ use crate::cpu::cpu::{
     get_seg64, io_port_read16, io_port_read32, io_port_read8, io_port_write16, io_port_write32,
     io_port_write8, read_reg16, read_reg32, read_reg64, safe_read16, safe_read32s, safe_read64s,
     safe_read8, safe_write16, safe_write32, safe_write64, safe_write8, set_reg_asize,
-    test_privileges_for_io, translate_address_read,
-    translate_address_write_and_can_skip_dirty, writable_or_pagefault, write_reg16, write_reg32,
-    write_reg64, write_reg8, AL, AX, DX, EAX, ECX, EDI, ES, ESI, FLAG_DIRECTION,
+    test_privileges_for_io, translate_address_read, translate_address_write_and_can_skip_dirty,
+    writable_or_pagefault, write_reg16, write_reg32, write_reg64, write_reg8, AL, AX, DX, EAX, ECX,
+    EDI, ES, ESI, FLAG_DIRECTION,
 };
 use crate::cpu::global_pointers::is_64;
 use crate::cpu::global_pointers::{flags, instruction_pointer, previous_ip};
@@ -202,18 +202,18 @@ unsafe fn string_instruction(
     let count_until_end_of_page = if rep_fast {
         match instruction {
             Instruction::Movs => {
-                let (addr, skip) = return_on_pagefault!(translate_address_write_and_can_skip_dirty(
-                    es.wrapping_add(dst)
-                ));
+                let (addr, skip) = return_on_pagefault!(
+                    translate_address_write_and_can_skip_dirty(es.wrapping_add(dst))
+                );
                 movs_into_svga_lfb = memory::in_svga_lfb(addr);
                 rep_fast = rep_fast && (!memory::in_mapped_range(addr) || movs_into_svga_lfb);
                 phys_dst = addr;
                 skip_dirty_page = skip;
             },
             Instruction::Stos | Instruction::Ins => {
-                let (addr, skip) = return_on_pagefault!(translate_address_write_and_can_skip_dirty(
-                    es.wrapping_add(dst)
-                ));
+                let (addr, skip) = return_on_pagefault!(
+                    translate_address_write_and_can_skip_dirty(es.wrapping_add(dst))
+                );
                 rep_fast = rep_fast && !memory::in_mapped_range(addr);
                 phys_dst = addr;
                 skip_dirty_page = skip;
@@ -304,9 +304,7 @@ unsafe fn string_instruction(
                         Size::B => memory::read8_no_mmap_check(phys_src) as u64,
                         Size::W => memory::read16_no_mmap_check(phys_src) as u32 as u64,
                         Size::D => memory::read32_no_mmap_check(phys_src) as u32 as u64,
-                        Size::Q => {
-                            memory::read64s(phys_src) as u64
-                        },
+                        Size::Q => memory::read64s(phys_src) as u64,
                     }
                 },
                 Instruction::Scas | Instruction::Stos => data & size_mask,
@@ -445,10 +443,7 @@ unsafe fn string_instruction(
                 Instruction::Ins => {
                     // check fault *before* reading from port
                     // (technically not necessary according to Intel manuals)
-                    break_on_pagefault!(writable_or_pagefault(
-                        es.wrapping_add(dst),
-                        size_bytes
-                    ));
+                    break_on_pagefault!(writable_or_pagefault(es.wrapping_add(dst), size_bytes));
                 },
                 _ => {},
             };
@@ -478,15 +473,14 @@ unsafe fn string_instruction(
                         dst_val = break_on_pagefault!(safe_read8(es.wrapping_add(dst))) as u64
                     },
                     Size::W => {
-                        dst_val = break_on_pagefault!(safe_read16(es.wrapping_add(dst))) as u32 as u64
+                        dst_val =
+                            break_on_pagefault!(safe_read16(es.wrapping_add(dst))) as u32 as u64
                     },
                     Size::D => {
                         dst_val =
                             break_on_pagefault!(safe_read32s(es.wrapping_add(dst))) as u32 as u64
                     },
-                    Size::Q => {
-                        dst_val = break_on_pagefault!(safe_read64s(es.wrapping_add(dst)))
-                    },
+                    Size::Q => dst_val = break_on_pagefault!(safe_read64s(es.wrapping_add(dst))),
                 },
                 Instruction::Outs => match size {
                     Size::B => io_port_write8(port, src_val as i32),
@@ -501,7 +495,9 @@ unsafe fn string_instruction(
                     Size::Q => write_reg64(EAX, src_val),
                 },
                 Instruction::Movs | Instruction::Stos | Instruction::Ins => match size {
-                    Size::B => break_on_pagefault!(safe_write8(es.wrapping_add(dst), src_val as i32)),
+                    Size::B => {
+                        break_on_pagefault!(safe_write8(es.wrapping_add(dst), src_val as i32))
+                    },
                     Size::W => {
                         break_on_pagefault!(safe_write16(es.wrapping_add(dst), src_val as i32))
                     },
@@ -517,9 +513,7 @@ unsafe fn string_instruction(
                 | Instruction::Cmps
                 | Instruction::Stos
                 | Instruction::Scas
-                | Instruction::Ins => {
-                    dst = dst.wrapping_add(increment as i64 as u64) & asize_mask
-                },
+                | Instruction::Ins => dst = dst.wrapping_add(increment as i64 as u64) & asize_mask,
                 _ => {},
             }
             match instruction {

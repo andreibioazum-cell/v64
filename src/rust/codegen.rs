@@ -129,10 +129,7 @@ pub fn gen_relative_jump_ctx(ctx: &mut JitContext, n: i32) {
 }
 
 /// previous_ip = instruction_pointer & ~0xFFF | low_bits
-pub fn gen_set_previous_eip_offset_from_eip_with_low_bits_ctx(
-    ctx: &mut JitContext,
-    low_bits: i32,
-) {
+pub fn gen_set_previous_eip_offset_from_eip_with_low_bits_ctx(ctx: &mut JitContext, low_bits: i32) {
     if !ctx.cpu.is_64() {
         return gen_set_previous_eip_offset_from_eip_with_low_bits(ctx.builder, low_bits);
     }
@@ -952,8 +949,12 @@ fn gen_safe_write(
         .load_aligned_i32(unsafe { &tlb_data[0] as *const i32 as u32 });
     let entry_local = ctx.builder.tee_new_local();
 
-    ctx.builder
-        .const_i32((0xFFF & !TLB_GLOBAL & !TLB_NOT_EXECUTABLE & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER })) as i32);
+    ctx.builder.const_i32(
+        (0xFFF
+            & !TLB_GLOBAL
+            & !TLB_NOT_EXECUTABLE
+            & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER })) as i32,
+    );
     ctx.builder.and_i32();
 
     ctx.builder.const_i32(TLB_VALID as i32);
@@ -1104,8 +1105,12 @@ pub fn gen_safe_read_write(
         .load_aligned_i32(unsafe { &tlb_data[0] as *const i32 as u32 });
     let entry_local = ctx.builder.tee_new_local();
 
-    ctx.builder
-        .const_i32((0xFFF & !TLB_GLOBAL & !TLB_NOT_EXECUTABLE & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER })) as i32);
+    ctx.builder.const_i32(
+        (0xFFF
+            & !TLB_GLOBAL
+            & !TLB_NOT_EXECUTABLE
+            & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER })) as i32,
+    );
     ctx.builder.and_i32();
 
     ctx.builder.const_i32(TLB_VALID as i32);

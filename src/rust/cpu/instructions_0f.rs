@@ -47,7 +47,9 @@ pub unsafe fn instr32_0F00_0_mem(addr: u64) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F00_0_mem(addr);
-    } instr16_0F00_0_mem(addr) }
+    }
+    instr16_0F00_0_mem(addr)
+}
 #[no_mangle]
 pub unsafe fn instr16_0F00_0_reg(r: i32) {
     if !*protected_mode || vm86_mode() {
@@ -84,7 +86,9 @@ pub unsafe fn instr32_0F00_1_mem(addr: u64) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F00_1_mem(addr);
-    } instr16_0F00_1_mem(addr) }
+    }
+    instr16_0F00_1_mem(addr)
+}
 #[no_mangle]
 pub unsafe fn instr16_0F00_1_reg(r: i32) {
     if !*protected_mode || vm86_mode() {
@@ -125,7 +129,9 @@ pub unsafe fn instr32_0F00_2_mem(addr: u64) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F00_2_mem(addr);
-    } instr16_0F00_2_mem(addr) }
+    }
+    instr16_0F00_2_mem(addr)
+}
 #[no_mangle]
 pub unsafe fn instr16_0F00_2_reg(r: i32) {
     if !*protected_mode || vm86_mode() {
@@ -145,7 +151,9 @@ pub unsafe fn instr32_0F00_2_reg(r: i32) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F00_2_reg(r);
-    } instr16_0F00_2_reg(r) }
+    }
+    instr16_0F00_2_reg(r)
+}
 
 #[no_mangle]
 pub unsafe fn instr16_0F00_3_mem(addr: u64) {
@@ -167,7 +175,9 @@ pub unsafe fn instr32_0F00_3_mem(addr: u64) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F00_3_mem(addr);
-    } instr16_0F00_3_mem(addr); }
+    }
+    instr16_0F00_3_mem(addr);
+}
 #[no_mangle]
 pub unsafe fn instr16_0F00_3_reg(r: i32) {
     if !*protected_mode || vm86_mode() {
@@ -187,7 +197,9 @@ pub unsafe fn instr32_0F00_3_reg(r: i32) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F00_3_reg(r);
-    } instr16_0F00_3_reg(r) }
+    }
+    instr16_0F00_3_reg(r)
+}
 
 #[no_mangle]
 pub unsafe fn instr16_0F00_4_mem(addr: u64) {
@@ -205,7 +217,9 @@ pub unsafe fn instr32_0F00_4_mem(addr: u64) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F00_4_mem(addr);
-    } instr16_0F00_4_mem(addr) }
+    }
+    instr16_0F00_4_mem(addr)
+}
 #[no_mangle]
 pub unsafe fn instr16_0F00_4_reg(r: i32) {
     if !*protected_mode || vm86_mode() {
@@ -222,7 +236,9 @@ pub unsafe fn instr32_0F00_4_reg(r: i32) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F00_4_reg(r);
-    } instr16_0F00_4_reg(r) }
+    }
+    instr16_0F00_4_reg(r)
+}
 #[no_mangle]
 pub unsafe fn instr16_0F00_5_mem(addr: u64) {
     if !*protected_mode || vm86_mode() {
@@ -239,7 +255,9 @@ pub unsafe fn instr32_0F00_5_mem(addr: u64) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F00_5_mem(addr);
-    } instr16_0F00_5_mem(addr) }
+    }
+    instr16_0F00_5_mem(addr)
+}
 #[no_mangle]
 pub unsafe fn instr16_0F00_5_reg(r: i32) {
     if !*protected_mode || vm86_mode() {
@@ -256,7 +274,9 @@ pub unsafe fn instr32_0F00_5_reg(r: i32) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F00_5_reg(r);
-    } instr16_0F00_5_reg(r) }
+    }
+    instr16_0F00_5_reg(r)
+}
 
 #[no_mangle]
 pub unsafe fn instr16_0F01_0_reg(_r: i32) { trigger_ud(); }
@@ -267,7 +287,9 @@ pub unsafe fn instr32_0F01_0_reg(_r: i32) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F01_0_reg(_r);
-    } trigger_ud(); }
+    }
+    trigger_ud();
+}
 
 unsafe fn sgdt(addr: u64, mask: i32) {
     return_on_pagefault!(writable_or_pagefault(addr, 6));
@@ -284,7 +306,9 @@ pub unsafe fn instr32_0F01_0_mem(addr: u64) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F01_0_mem(addr);
-    } sgdt(addr, -1) }
+    }
+    sgdt(addr, -1)
+}
 
 #[no_mangle]
 pub unsafe fn instr16_0F01_1_reg(_r: i32) { trigger_ud(); }
@@ -295,7 +319,9 @@ pub unsafe fn instr32_0F01_1_reg(_r: i32) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F01_1_reg(_r);
-    } trigger_ud(); }
+    }
+    trigger_ud();
+}
 
 unsafe fn sidt(addr: u64, mask: i32) {
     return_on_pagefault!(writable_or_pagefault(addr, 6));
@@ -312,7 +338,9 @@ pub unsafe fn instr32_0F01_1_mem(addr: u64) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F01_1_mem(addr);
-    } sidt(addr, -1) }
+    }
+    sidt(addr, -1)
+}
 
 #[no_mangle]
 pub unsafe fn instr16_0F01_2_reg(_r: i32) { trigger_ud(); }
@@ -323,7 +351,9 @@ pub unsafe fn instr32_0F01_2_reg(_r: i32) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F01_2_reg(_r);
-    } trigger_ud(); }
+    }
+    trigger_ud();
+}
 
 unsafe fn lgdt(addr: u64, mask: i32) {
     if 0 != *cpl {
@@ -345,7 +375,9 @@ pub unsafe fn instr32_0F01_2_mem(addr: u64) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F01_2_mem(addr);
-    } lgdt(addr, -1); }
+    }
+    lgdt(addr, -1);
+}
 
 #[no_mangle]
 pub unsafe fn instr16_0F01_3_reg(_r: i32) { trigger_ud(); }
@@ -356,7 +388,9 @@ pub unsafe fn instr32_0F01_3_reg(_r: i32) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F01_3_reg(_r);
-    } trigger_ud(); }
+    }
+    trigger_ud();
+}
 
 unsafe fn lidt(addr: u64, mask: i32) {
     if 0 != *cpl {
@@ -378,7 +412,9 @@ pub unsafe fn instr32_0F01_3_mem(addr: u64) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F01_3_mem(addr);
-    } lidt(addr, -1); }
+    }
+    lidt(addr, -1);
+}
 
 #[no_mangle]
 pub unsafe fn instr16_0F01_4_reg(r: i32) {
@@ -392,7 +428,9 @@ pub unsafe fn instr32_0F01_4_reg(r: i32) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F01_4_reg(r);
-    } write_reg32(r, *cr); }
+    }
+    write_reg32(r, *cr);
+}
 #[no_mangle]
 pub unsafe fn instr16_0F01_4_mem(addr: u64) {
     return_on_pagefault!(safe_write16(addr, *cr & 0xFFFF));
@@ -429,7 +467,9 @@ pub unsafe fn instr32_0F01_6_reg(r: i32) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F01_6_reg(r);
-    } instr16_0F01_6_reg(r); }
+    }
+    instr16_0F01_6_reg(r);
+}
 #[no_mangle]
 pub unsafe fn instr16_0F01_6_mem(addr: u64) {
     if 0 != *cpl {
@@ -445,7 +485,9 @@ pub unsafe fn instr32_0F01_6_mem(addr: u64) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F01_6_mem(addr);
-    } instr16_0F01_6_mem(addr) }
+    }
+    instr16_0F01_6_mem(addr)
+}
 
 #[no_mangle]
 pub unsafe fn instr16_0F01_7_reg(_r: i32) { trigger_ud(); }
@@ -456,7 +498,9 @@ pub unsafe fn instr32_0F01_7_reg(_r: i32) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F01_7_reg(_r);
-    } trigger_ud(); }
+    }
+    trigger_ud();
+}
 
 #[no_mangle]
 pub unsafe fn instr16_0F01_7_mem(addr: u64) {
@@ -474,7 +518,9 @@ pub unsafe fn instr32_0F01_7_mem(addr: u64) {
     }
     if *is_64 {
         return crate::cpu::instructions_64::instr64_0F01_7_mem(addr);
-    } instr16_0F01_7_mem(addr) }
+    }
+    instr16_0F01_7_mem(addr)
+}
 
 #[no_mangle]
 pub unsafe fn instr16_0F02_mem(addr: u64, r: i32) {

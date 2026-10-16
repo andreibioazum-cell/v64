@@ -594,9 +594,7 @@ pub unsafe fn shl64(dest_operand: u64, count: i32) -> u64 {
     *last_op_size = OPSIZE_64;
     *flags_changed = FLAGS_ALL & !1 & !FLAG_OVERFLOW;
     let b = (dest_operand >> (64 - count) & 1) as i32;
-    *flags = *flags & !1 & !FLAG_OVERFLOW
-        | b
-        | ((b ^ (result >> 63) as i32) << 11) & FLAG_OVERFLOW;
+    *flags = *flags & !1 & !FLAG_OVERFLOW | b | ((b ^ (result >> 63) as i32) << 11) & FLAG_OVERFLOW;
     return result;
 }
 pub unsafe fn shr64(dest_operand: u64, count: i32) -> u64 {
@@ -690,9 +688,7 @@ pub unsafe fn shld64(dest_operand: u64, source_operand: u64, count: i32) -> u64 
     *last_op_size = OPSIZE_64;
     *flags_changed = FLAGS_ALL & !1 & !FLAG_OVERFLOW;
     let b = (dest_operand >> (64 - count) & 1) as i32;
-    *flags = *flags & !1 & !FLAG_OVERFLOW
-        | b
-        | ((b ^ (result >> 63) as i32) << 11) & FLAG_OVERFLOW;
+    *flags = *flags & !1 & !FLAG_OVERFLOW | b | ((b ^ (result >> 63) as i32) << 11) & FLAG_OVERFLOW;
     return result;
 }
 pub unsafe fn shrd64(dest_operand: u64, source_operand: u64, count: i32) -> u64 {
@@ -1400,7 +1396,9 @@ pub unsafe fn bt_mem(virt_addr: u64, mut bit_offset: i32) {
     *flags_changed &= !1;
 }
 pub unsafe fn btc_mem(virt_addr: u64, mut bit_offset: i32) {
-    let phys_addr = return_on_pagefault!(translate_address_write(virt_addr + (bit_offset >> 3) as u64));
+    let phys_addr = return_on_pagefault!(translate_address_write(
+        virt_addr + (bit_offset >> 3) as u64
+    ));
     let bit_base = memory::read8(phys_addr);
     bit_offset &= 7;
     *flags = *flags & !1 | bit_base >> bit_offset & 1;
@@ -1408,7 +1406,9 @@ pub unsafe fn btc_mem(virt_addr: u64, mut bit_offset: i32) {
     memory::write8(phys_addr, bit_base ^ 1 << bit_offset);
 }
 pub unsafe fn btr_mem(virt_addr: u64, mut bit_offset: i32) {
-    let phys_addr = return_on_pagefault!(translate_address_write(virt_addr + (bit_offset >> 3) as u64));
+    let phys_addr = return_on_pagefault!(translate_address_write(
+        virt_addr + (bit_offset >> 3) as u64
+    ));
     let bit_base = memory::read8(phys_addr);
     bit_offset &= 7;
     *flags = *flags & !1 | bit_base >> bit_offset & 1;
@@ -1416,7 +1416,9 @@ pub unsafe fn btr_mem(virt_addr: u64, mut bit_offset: i32) {
     memory::write8(phys_addr, bit_base & !(1 << bit_offset));
 }
 pub unsafe fn bts_mem(virt_addr: u64, mut bit_offset: i32) {
-    let phys_addr = return_on_pagefault!(translate_address_write(virt_addr + (bit_offset >> 3) as u64));
+    let phys_addr = return_on_pagefault!(translate_address_write(
+        virt_addr + (bit_offset >> 3) as u64
+    ));
     let bit_base = memory::read8(phys_addr);
     bit_offset &= 7;
     *flags = *flags & !1 | bit_base >> bit_offset & 1;
