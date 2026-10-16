@@ -54,6 +54,12 @@ jobs:
       - name: Build fallback
         run: make build/v86-fallback.wasm
 
+      - name: Upload the artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: index.html
+          path: build/index.html
+
       - name: rustfmt check
         run: make rustfmt
 
@@ -122,12 +128,6 @@ jobs:
 
       - name: Run expect tests
         run: make expect-tests
-
-      - name: Upload the artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: index.html
-          path: build/index.html
 
   upload:
     name: Upload release
