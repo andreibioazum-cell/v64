@@ -68,9 +68,9 @@ function fail(message) {
 
         // Write and read back a byte in several places, including the top of the RAM.
         // The old value is restored in the same evaluate, so the guest is not disturbed.
-        const probes = await page.evaluate((size) => {
+        const probes = await page.evaluate((size, MiB) => {
             const mem8 = window.emulator.v86.cpu.mem8;
-            const addresses = [MiB, 0x40000000, 0x7fff0000, size - 1];
+            const addresses = [MiB, 0x40000000, size - 0x10000, size - 1];
             return addresses.map((addr) => {
                 const old = mem8[addr];
                 const value = (addr * 7 + 3) & 0xff;
@@ -79,7 +79,7 @@ function fail(message) {
                 mem8[addr] = old;
                 return { addr, ok };
             });
-        }, size);
+        }, size, MiB);
         for(const p of probes) {
             console.log("memory probe 0x" + p.addr.toString(16) + ": " + (p.ok ? "ok" : "FAILED"));
             if(!p.ok) fail("guest RAM not writable at 0x" + p.addr.toString(16));
