@@ -123,22 +123,11 @@ jobs:
       - name: Run expect tests
         run: make expect-tests
 
-      - name: Update package.json version
-        run: make update-package-json-version
-
       - name: Upload the artifact
         uses: actions/upload-artifact@v7
         with:
-          name: v86
-          path: |
-            package.json
-            LICENSE
-            Readme.md
-            v86.d.ts
-            build/libv86*.js
-            build/libv86*.js.map
-            build/v86*.wasm
-            build/*.mjs
+          name: index.html
+          path: build/index.html
 
   upload:
     name: Upload release
@@ -147,7 +136,6 @@ jobs:
     if: github.ref == 'refs/heads/master'
 
     permissions:
-      id-token: write
       contents: write
 
     steps:
@@ -161,15 +149,7 @@ jobs:
       - name: Get artifacts
         uses: actions/download-artifact@v8
         with:
-          name: v86
-
-      - name: Display structure of downloaded files
-        run: ls -R
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '24.17.0'
-          registry-url: 'https://registry.npmjs.org'
+          name: index.html
 
       - name: Release to GitHub
         uses: ncipollo/release-action@v1
@@ -178,9 +158,5 @@ jobs:
           tag: latest
           commit: master
           body: ${{ github.event.head_commit.message }}
-          artifacts: "build/libv86*.js,build/libv86*.js.map,build/*.mjs,build/v86*.wasm"
+          artifacts: "index.html"
           prerelease: true
-
-      - name: Release to NPM
-        run: npm publish --provenance --access public
-        if: github.repository == 'copy/v86'

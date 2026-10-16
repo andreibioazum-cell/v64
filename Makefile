@@ -22,7 +22,7 @@ endif
 WASM_OPT ?= false
 
 default: build/v86-debug.wasm
-all: build/v86_all.js build/libv86.js build/libv86.mjs build/v86.wasm
+all: build/index.html build/v86_all.js build/libv86.js build/libv86.mjs build/v86.wasm
 all-debug: build/libv86-debug.js build/libv86-debug.mjs build/v86-debug.wasm
 browser: build/v86_all.js
 
@@ -101,6 +101,10 @@ RUST_FILES=$(shell find src/rust/ -name '*.rs') \
 CORE_FILES:=$(addprefix src/,$(CORE_FILES))
 LIB_FILES:=$(addprefix lib/,$(LIB_FILES))
 BROWSER_FILES:=$(addprefix src/browser/,$(BROWSER_FILES))
+
+# Single self-contained page: libv86 + wasm + BIOS inlined, see site/ and tools/build-single-html.mjs
+build/index.html: build/libv86.js build/v86.wasm bios/seabios.bin bios/vgabios.bin site/index.html site/app.js tools/build-single-html.mjs
+	node tools/build-single-html.mjs build/index.html
 
 build/v86_all.js: $(CLOSURE) src/*.js src/browser/*.js lib/*.js
 	mkdir -p build
@@ -282,18 +286,6 @@ clean:
 run:
 	python3 -m http.server 2> /dev/null
 
-update_version:
-	set -e ;\
-	COMMIT=`git log --format="%h" -n 1` ;\
-	DATE=`git log --date="format:%b %e, %Y %H:%m" --format="%cd" -n 1` ;\
-	SEARCH='<code>Version: <a id="version" href="https://github.com/copy/v86/commits/[a-f0-9]\+">[a-f0-9]\+</a> ([^(]\+)</code>' ;\
-	REPLACE='<code>Version: <a id="version" href="https://github.com/copy/v86/commits/'$$COMMIT'">'$$COMMIT'</a> ('$$DATE')</code>' ;\
-	sed -i "s@$$SEARCH@$$REPLACE@g" index.html ;\
-	SEARCH='<script src="build/v86_all.js?[a-f0-9]\+"></script>' ;\
-	REPLACE='<script src="build/v86_all.js?'$$COMMIT'"></script>' ;\
-	sed -i "s@$$SEARCH@$$REPLACE@g" index.html ;\
-	grep $$COMMIT index.html
-
 
 $(CLOSURE):
 	mkdir -p $(CLOSURE_DIR)
@@ -399,7 +391,7 @@ all-tests: eslint kvm-unit-test qemutests qemutests-release jitpagingtests api-t
 	# - devices-test (hangs)
 
 eslint:
-	eslint src tests gen lib examples tools
+	eslint src tests gen lib tools site
 
 rustfmt: $(RUST_FILES)
 	cargo fmt --all -- --check --config fn_single_line=true,control_brace_style=ClosingNextLine
