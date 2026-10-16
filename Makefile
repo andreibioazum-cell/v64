@@ -388,8 +388,10 @@ api-tests: build/v86-debug.wasm
 
 # Guest RAM of 2 GiB (the largest size the site offers): boots buildroot and
 # allocates ~1.8 GiB inside the guest. Needs images/buildroot-bzimage68.bin.
+# The script prints "test finished" whatever Lua did, so the check is that Lua printed "ok".
 memory-2g-test: build/libv86.mjs build/v86.wasm
-	TEST_RELEASE_BUILD=1 timeout 900 ./tests/api/2g-mem.js
+	TEST_RELEASE_BUILD=1 timeout 900 ./tests/api/2g-mem.js 2>&1 | tee build/2g-mem.log
+	grep -q "Serial: ok$$" build/2g-mem.log
 
 all-tests: eslint kvm-unit-test qemutests qemutests-release jitpagingtests api-tests memory-2g-test nasmtests nasmtests-force-jit rust-test tests expect-tests
 	# Skipping:
