@@ -14,6 +14,7 @@
     var emulator = null;
     var iso_file = null;
     var paused = false;
+    var booted = false;
 
     var el = function(id) { return document.getElementById(id); };
     var iso_input = el("iso");
@@ -25,6 +26,7 @@
     var fullscreen_btn = el("fullscreen");
     var typing = el("typing");
     var status = el("status");
+    var ram_select = el("ram");
 
     function decode_base64(b64)
     {
@@ -61,10 +63,38 @@
         return window.matchMedia("(max-width: 720px)").matches;
     }
 
+    function selected_ram_mib()
+    {
+        return parseInt(ram_select.value, 10);
+    }
+
+    // Chrome reports device memory in GB (rounded, capped at 8); other browsers do not report it.
+    // Guest RAM above half of the device memory is likely to fail, so warn about it.
+    function ram_warning()
+    {
+        var device_gb = navigator.deviceMemory;
+        var ram_mib = selected_ram_mib();
+        if(device_gb && ram_mib > device_gb * 1024 / 2)
+        {
+            return "Внимание: браузер сообщает около " + device_gb + " ГБ памяти устройства, " + ram_mib + " МиБ для гостя может не запуститься.";
+        }
+        return "";
+    }
+
+    function on_start_failed(message)
+    {
+        emulator = window.emulator = null;
+        paused = false;
+        ram_select.disabled = false;
+        start_btn.disabled = false;
+        set_running_controls(false);
+        set_status("Ошибка запуска: " + message + ". Выберите меньший объём ОЗУ и запустите снова.");
+    }
+
     function create_emulator()
     {
-        // The guest needs RAM for the live system; smaller phones get less.
-        var memory_size = (is_small_screen() ? 256 : 512) * MiB;
+        booted = false;
+        ram_select.disabled = true;
 
         emulator = window.emulator = new V86({
             wasm_fn: function(imports)
@@ -75,13 +105,18 @@
                 });
             },
             screen_container: el("screen_container"),
-            memory_size: memory_size,
+            memory_size: selected_ram_mib() * MiB,
             vga_memory_size: 8 * MiB,
             bios: { buffer: seabios.buffer },
             vga_bios: { buffer: vgabios.buffer },
             cdrom: { buffer: iso_file },
             autostart: true,
             disable_speaker: true,
+        });
+
+        emulator.add_listener("emulator-started", function()
+        {
+            booted = true;
         });
     }
 
@@ -132,13 +167,33 @@
                 emulator.run();
             }
             paused = false;
-            set_status("Работает");
+            set_status("Работает" + (ram_warning() ? ". " + ram_warning() : ""));
             set_running_controls(true);
         }
         catch(err)
         {
-            start_btn.disabled = false;
-            set_status("Ошибка запуска: " + (err && err.message ? err.message : err));
+            on_start_failed(err && err.message ? err.message : String(err));
+        }
+    });
+
+    ram_select.addEventListener("change", function()
+    {
+        set_status(ram_warning() || "ОЗУ гостя: " + selected_ram_mib() + " МиБ. Изменить можно после перезагрузки страницы.");
+    });
+
+    // The V86 constructor starts the machine asynchronously (wasm and BIOS loading,
+    // guest memory allocation), so a failure there surfaces as an unhandled rejection.
+    window.addEventListener("unhandledrejection", function(e)
+    {
+        var reason = e.reason;
+        var message = reason && reason.message ? reason.message : String(reason);
+        if(emulator && !booted)
+        {
+            on_start_failed(message);
+        }
+        else
+        {
+            set_status("Ошибка: " + message);
         }
     });
 
@@ -225,7 +280,11 @@
         }
     });
 
+    // Narrow screens are usually phones with less RAM.
+    ram_select.value = String(is_small_screen() ? 256 : 512);
+
     set_running_controls(false);
     set_status("Выберите ISO-образ.");
     iso_input.disabled = false;
+    ram_select.disabled = false;
 })();

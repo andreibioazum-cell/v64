@@ -71,6 +71,17 @@ button, .file_button {
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button:disabled { opacity: .4; cursor: default; }
 button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+#ram {
+    font: inherit;
+    min-height: 44px;
+    padding: 8px 10px;
+    color: var(--fg);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+#ram:disabled { opacity: .4; }
+.ram_label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
 #iso { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 
 #typing {
@@ -110,6 +121,14 @@ button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accen
     <div id="controls">
         <label class="file_button" id="iso_label">Выбрать ISO<input id="iso" type="file" accept=".iso,.img,.raw,application/x-iso9660-image"></label>
         <span id="iso_name">образ не выбран</span>
+        <label class="ram_label" for="ram">ОЗУ
+            <select id="ram" disabled>
+                <option value="256">256 МиБ</option>
+                <option value="512">512 МиБ</option>
+                <option value="1024">1024 МиБ</option>
+                <option value="2048">2048 МиБ</option>
+            </select>
+        </label>
         <button id="start" class="primary" disabled>Запустить</button>
         <button id="pause" disabled>Пауза</button>
         <button id="reset" disabled>Перезапуск</button>

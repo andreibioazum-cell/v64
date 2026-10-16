@@ -1028,7 +1028,13 @@ CPU.prototype.create_memory = function(size, minimum_size)
 
     this.memory_size[0] = size;
 
-    const memory_offset = this.allocate_memory(size);
+    const memory_offset = this.allocate_memory(size) >>> 0;
+    if(memory_offset === 0)
+    {
+        // rust returns a null pointer when the wasm memory cannot grow this far;
+        // without this check the guest RAM would silently alias address 0
+        throw new Error("Could not allocate " + (size / 1024 / 1024) + " MiB of guest memory (out of browser memory)");
+    }
 
     this.mem8 = view(Uint8Array, this.wasm_memory, memory_offset, size);
     this.mem32s = view(Uint32Array, this.wasm_memory, memory_offset, size >> 2);

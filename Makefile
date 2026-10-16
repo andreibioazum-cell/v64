@@ -386,7 +386,12 @@ api-tests: build/v86-debug.wasm
 	#./tests/api/reboot-buildroot.js # https://github.com/copy/v86/issues/636
 	./tests/api/pic.js
 
-all-tests: eslint kvm-unit-test qemutests qemutests-release jitpagingtests api-tests nasmtests nasmtests-force-jit rust-test tests expect-tests
+# Guest RAM of 2 GiB (the largest size the site offers): boots buildroot and
+# allocates ~1.8 GiB inside the guest. Needs images/buildroot-bzimage68.bin.
+memory-2g-test: build/libv86.mjs build/v86.wasm
+	TEST_RELEASE_BUILD=1 timeout 900 ./tests/api/2g-mem.js
+
+all-tests: eslint kvm-unit-test qemutests qemutests-release jitpagingtests api-tests memory-2g-test nasmtests nasmtests-force-jit rust-test tests expect-tests
 	# Skipping:
 	# - devices-test (hangs)
 

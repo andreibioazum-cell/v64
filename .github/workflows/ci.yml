@@ -15,6 +15,34 @@ jobs:
       - name: Run eslint
         run: sudo npm install -g eslint; make eslint
 
+  memory-2g:
+    runs-on: ubuntu-latest
+    name: 2 GiB guest RAM
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js version
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.17.0'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Setup toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add wasm32-unknown-unknown
+
+      - name: Build libv86 and v86.wasm
+        run: make build/libv86.mjs build/v86.wasm
+
+      - name: Download buildroot image
+        run: mkdir -p images && curl --compressed --output-dir images --remote-name-all https://i.copy.sh/buildroot-bzimage68.bin
+
+      - name: Run 2 GiB guest memory test
+        run: make memory-2g-test
+
   test:
     runs-on: ubuntu-latest
     name: Build and test
