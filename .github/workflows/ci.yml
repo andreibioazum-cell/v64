@@ -43,6 +43,45 @@ jobs:
       - name: Run 2 GiB guest memory test
         run: make memory-2g-test
 
+  site-browser:
+    runs-on: ubuntu-latest
+    name: Site in Chrome with 2 GiB guest RAM
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js version
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.17.0'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Setup toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add wasm32-unknown-unknown
+
+      - name: Build site
+        run: make build/index.html
+
+      - name: Install puppeteer-core
+        run: npm install --prefix /tmp/browser-test --no-save puppeteer-core@24
+
+      - name: Run site in Chrome with 2048 MiB
+        run: |
+          CHROME_PATH="$(command -v google-chrome || command -v chromium-browser || command -v chromium)"
+          echo "Chrome: $CHROME_PATH"
+          CHROME_PATH="$CHROME_PATH" NODE_PATH=/tmp/browser-test/node_modules timeout 900 node tests/browser/site-ram.cjs
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-2048-screenshot
+          path: build/site-2048.png
+          if-no-files-found: ignore
+
   test:
     runs-on: ubuntu-latest
     name: Build and test

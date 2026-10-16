@@ -81,19 +81,54 @@
         return "";
     }
 
+    // Sizes the page offers, largest first. When guest RAM cannot be allocated the
+    // page falls back to the next smaller size instead of leaving the user stuck.
+    var RAM_SIZES_MIB = [2048, 1024, 512, 256];
+    var ALLOCATION_ERROR = "Could not allocate";
+    var started_ram_mib = 0;
+
+    function next_smaller_ram(ram_mib)
+    {
+        var index = RAM_SIZES_MIB.indexOf(ram_mib);
+        return index === -1 ? 0 : (RAM_SIZES_MIB[index + 1] || 0);
+    }
+
     function on_start_failed(message)
     {
         emulator = window.emulator = null;
         paused = false;
+
+        var smaller = next_smaller_ram(started_ram_mib);
+        if(message.indexOf(ALLOCATION_ERROR) !== -1 && smaller)
+        {
+            set_status("Не удалось выделить " + started_ram_mib + " МиБ, пробую " + smaller + " МиБ…");
+            start_with_ram(smaller);
+            return;
+        }
+
         ram_select.disabled = false;
         start_btn.disabled = false;
         set_running_controls(false);
         set_status("Ошибка запуска: " + message + ". Выберите меньший объём ОЗУ и запустите снова.");
     }
 
-    function create_emulator()
+    function start_with_ram(ram_mib)
+    {
+        try
+        {
+            create_emulator(ram_mib);
+        }
+        catch(err)
+        {
+            on_start_failed(err && err.message ? err.message : String(err));
+        }
+    }
+
+    function create_emulator(ram_mib)
     {
         booted = false;
+        started_ram_mib = ram_mib;
+        ram_select.value = String(ram_mib);
         ram_select.disabled = true;
 
         emulator = window.emulator = new V86({
@@ -105,7 +140,7 @@
                 });
             },
             screen_container: el("screen_container"),
-            memory_size: selected_ram_mib() * MiB,
+            memory_size: ram_mib * MiB,
             vga_memory_size: 8 * MiB,
             bios: { buffer: seabios.buffer },
             vga_bios: { buffer: vgabios.buffer },
@@ -117,6 +152,10 @@
         emulator.add_listener("emulator-started", function()
         {
             booted = true;
+            if(!paused)
+            {
+                set_status("Работает, ОЗУ гостя: " + started_ram_mib + " МиБ");
+            }
         });
     }
 
@@ -156,18 +195,24 @@
         }
 
         start_btn.disabled = true;
+        if(!emulator)
+        {
+            start_with_ram(selected_ram_mib());
+            // A synchronous failure has already set the error status and cleared emulator.
+            if(emulator)
+            {
+                paused = false;
+                set_status("Работает" + (ram_warning() ? ". " + ram_warning() : ""));
+                set_running_controls(true);
+            }
+            return;
+        }
+
         try
         {
-            if(!emulator)
-            {
-                create_emulator();
-            }
-            else
-            {
-                emulator.run();
-            }
+            emulator.run();
             paused = false;
-            set_status("Работает" + (ram_warning() ? ". " + ram_warning() : ""));
+            set_status("Работает");
             set_running_controls(true);
         }
         catch(err)
