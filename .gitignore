@@ -25,6 +25,9 @@ src/rust/gen/analyzer.rs
 src/rust/gen/analyzer0f.rs
 src/rust/gen/jit.rs
 src/rust/gen/jit0f.rs
+src/rust/gen/jit64.rs
+src/rust/gen/jit64_0f.rs
+src/rust/gen/jit64_wrappers.rs
 bios/seabios
 bench-results
 .devcontainer/devcontainer-lock.json

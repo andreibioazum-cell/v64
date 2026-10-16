@@ -437,6 +437,384 @@ pub unsafe fn xor8(x: i32, y: i32) -> i32 { return xor(x, y, OPSIZE_8); }
 pub unsafe fn xor16(x: i32, y: i32) -> i32 { return xor(x, y, OPSIZE_16); }
 pub unsafe fn xor32(x: i32, y: i32) -> i32 { return xor(x, y, OPSIZE_32); }
 
+// === 64-bit operations (long mode) ===
+// Lazy-flag operands go to the 64-bit slots last_op1_64/last_result_64 with
+// last_op_size = OPSIZE_64; the flag readers in misc_instr.rs handle them.
+
+pub unsafe fn add64(x: u64, y: u64) -> u64 {
+    let res = x.wrapping_add(y);
+    *last_op1_64 = x;
+    *last_result_64 = res;
+    *last_op_size = OPSIZE_64;
+    *flags_changed = FLAGS_ALL;
+    return res;
+}
+pub unsafe fn adc64(x: u64, y: u64) -> u64 {
+    let cf = getcf() as u64;
+    let res = x.wrapping_add(y).wrapping_add(cf);
+    *last_op1_64 = x;
+    *last_result_64 = res;
+    *last_op_size = OPSIZE_64;
+    *flags_changed = FLAGS_ALL & !FLAG_CARRY & !FLAG_ADJUST & !FLAG_OVERFLOW;
+    *flags = *flags & !FLAG_CARRY & !FLAG_ADJUST & !FLAG_OVERFLOW
+        | ((x ^ ((x ^ y) & (y ^ res))) >> 63) as i32 & FLAG_CARRY
+        | (x ^ y ^ res) as i32 & FLAG_ADJUST
+        | ((((y ^ res) & (x ^ res)) >> 63) as i32) << 11 & FLAG_OVERFLOW;
+    return res;
+}
+pub unsafe fn sub64(x: u64, y: u64) -> u64 {
+    let res = x.wrapping_sub(y);
+    *last_op1_64 = x;
+    *last_result_64 = res;
+    *last_op_size = OPSIZE_64;
+    *flags_changed = FLAGS_ALL | FLAG_SUB;
+    return res;
+}
+pub unsafe fn sbb64(x: u64, y: u64) -> u64 {
+    let cf = getcf() as u64;
+    let res = x.wrapping_sub(y).wrapping_sub(cf);
+    *last_op1_64 = x;
+    *last_result_64 = res;
+    *last_op_size = OPSIZE_64;
+    *flags_changed = FLAGS_ALL & !FLAG_CARRY & !FLAG_ADJUST & !FLAG_OVERFLOW | FLAG_SUB;
+    *flags = *flags & !FLAG_CARRY & !FLAG_ADJUST & !FLAG_OVERFLOW
+        | ((res ^ ((res ^ y) & (y ^ x))) >> 63) as i32 & FLAG_CARRY
+        | (x ^ y ^ res) as i32 & FLAG_ADJUST
+        | ((((y ^ x) & (res ^ x)) >> 63) as i32) << 11 & FLAG_OVERFLOW;
+    return res;
+}
+pub unsafe fn cmp64(x: u64, y: u64) { sub64(x, y); }
+pub unsafe fn inc64(x: u64) -> u64 {
+    *flags = *flags & !1 | getcf() as i32;
+    let res = x.wrapping_add(1);
+    *last_op1_64 = x;
+    *last_result_64 = res;
+    *last_op_size = OPSIZE_64;
+    *flags_changed = FLAGS_ALL & !1;
+    return res;
+}
+pub unsafe fn dec64(x: u64) -> u64 {
+    *flags = *flags & !1 | getcf() as i32;
+    let res = x.wrapping_sub(1);
+    *last_op1_64 = x;
+    *last_result_64 = res;
+    *last_op_size = OPSIZE_64;
+    *flags_changed = FLAGS_ALL & !1 | FLAG_SUB;
+    return res;
+}
+pub unsafe fn neg64(x: u64) -> u64 { sub64(0, x) }
+pub unsafe fn not64(x: u64) -> u64 { !x }
+
+unsafe fn logic64(result: u64) -> u64 {
+    *last_result_64 = result;
+    *last_op_size = OPSIZE_64;
+    *flags &= !1 & !FLAG_OVERFLOW & !FLAG_ADJUST;
+    *flags_changed = FLAGS_ALL & !1 & !FLAG_OVERFLOW & !FLAG_ADJUST;
+    return result;
+}
+pub unsafe fn and64(x: u64, y: u64) -> u64 { logic64(x & y) }
+pub unsafe fn or64(x: u64, y: u64) -> u64 { logic64(x | y) }
+pub unsafe fn xor64(x: u64, y: u64) -> u64 { logic64(x ^ y) }
+pub unsafe fn test64(x: u64, y: u64) { and64(x, y); }
+
+pub unsafe fn mul64(source_operand: u64) {
+    let result = (source_operand as u128) * (read_reg64(EAX) as u128);
+    let result_low = result as u64;
+    let result_high = (result >> 64) as u64;
+    write_reg64(EAX, result_low);
+    write_reg64(EDX, result_high);
+    *last_result_64 = result_low;
+    *last_op_size = OPSIZE_64;
+    if result_high == 0 {
+        *flags &= !1 & !FLAG_OVERFLOW
+    }
+    else {
+        *flags |= 1 | FLAG_OVERFLOW
+    }
+    *flags_changed = FLAGS_ALL & !1 & !FLAG_OVERFLOW;
+}
+pub unsafe fn imul64(source_operand: u64) {
+    let result = (read_reg64(EAX) as i64 as i128) * (source_operand as i64 as i128);
+    let result_low = result as u64;
+    let result_high = (result >> 64) as u64;
+    write_reg64(EAX, result_low);
+    write_reg64(EDX, result_high);
+    *last_result_64 = result_low;
+    *last_op_size = OPSIZE_64;
+    if result_high == (result_low as i64 >> 63) as u64 {
+        *flags &= !1 & !FLAG_OVERFLOW
+    }
+    else {
+        *flags |= 1 | FLAG_OVERFLOW
+    }
+    *flags_changed = FLAGS_ALL & !1 & !FLAG_OVERFLOW;
+}
+pub unsafe fn imul_reg64(operand1: u64, operand2: u64) -> u64 {
+    let result = (operand1 as i64 as i128) * (operand2 as i64 as i128);
+    let result_low = result as u64;
+    let result_high = (result >> 64) as u64;
+    *last_result_64 = result_low;
+    *last_op_size = OPSIZE_64;
+    if result_high == (result_low as i64 >> 63) as u64 {
+        *flags &= !1 & !FLAG_OVERFLOW
+    }
+    else {
+        *flags |= 1 | FLAG_OVERFLOW
+    }
+    *flags_changed = FLAGS_ALL & !1 & !FLAG_OVERFLOW;
+    return result_low;
+}
+
+pub unsafe fn xadd64(source_operand: u64, reg: i32) -> u64 {
+    let tmp = read_reg64(reg);
+    write_reg64(reg, source_operand);
+    return add64(source_operand, tmp);
+}
+
+pub unsafe fn cmpxchg64(data: u64, r: i32) -> u64 {
+    cmp64(read_reg64(EAX), data);
+    if getzf() {
+        read_reg64(r)
+    }
+    else {
+        write_reg64(EAX, data);
+        data
+    }
+}
+
+// 64-bit shifts and rotates; count is masked to 6 bits by the caller
+
+pub unsafe fn shl64(dest_operand: u64, count: i32) -> u64 {
+    dbg_assert!(count >= 0 && count < 64);
+    if count == 0 {
+        return dest_operand;
+    }
+    let result = dest_operand << count;
+    *last_result_64 = result;
+    *last_op_size = OPSIZE_64;
+    *flags_changed = FLAGS_ALL & !1 & !FLAG_OVERFLOW;
+    let b = (dest_operand >> (64 - count) & 1) as i32;
+    *flags = *flags & !1 & !FLAG_OVERFLOW
+        | b
+        | ((b ^ (result >> 63) as i32) << 11) & FLAG_OVERFLOW;
+    return result;
+}
+pub unsafe fn shr64(dest_operand: u64, count: i32) -> u64 {
+    dbg_assert!(count >= 0 && count < 64);
+    if count == 0 {
+        return dest_operand;
+    }
+    let result = dest_operand >> count;
+    *last_result_64 = result;
+    *last_op_size = OPSIZE_64;
+    *flags_changed = FLAGS_ALL & !1 & !FLAG_OVERFLOW;
+    *flags = *flags & !1 & !FLAG_OVERFLOW
+        | (dest_operand >> (count - 1) & 1) as i32
+        | (dest_operand >> 52) as i32 & FLAG_OVERFLOW;
+    return result;
+}
+pub unsafe fn sar64(dest_operand: u64, count: i32) -> u64 {
+    dbg_assert!(count >= 0 && count < 64);
+    if count == 0 {
+        return dest_operand;
+    }
+    let result = (dest_operand as i64 >> count) as u64;
+    *last_result_64 = result;
+    *last_op_size = OPSIZE_64;
+    *flags_changed = FLAGS_ALL & !1 & !FLAG_OVERFLOW;
+    *flags = *flags & !1 & !FLAG_OVERFLOW | (dest_operand >> (count - 1) & 1) as i32;
+    return result;
+}
+pub unsafe fn rol64(dest_operand: u64, count: i32) -> u64 {
+    dbg_assert!(count >= 0 && count < 64);
+    if count == 0 {
+        return dest_operand;
+    }
+    let result = dest_operand.rotate_left(count as u32);
+    *flags_changed &= !1 & !FLAG_OVERFLOW;
+    *flags = *flags & !1 & !FLAG_OVERFLOW
+        | (result & 1) as i32
+        | (((result & 1) as i32 ^ (result >> 63) as i32) << 11) & FLAG_OVERFLOW;
+    return result;
+}
+pub unsafe fn ror64(dest_operand: u64, count: i32) -> u64 {
+    dbg_assert!(count >= 0 && count < 64);
+    if count == 0 {
+        return dest_operand;
+    }
+    let result = dest_operand.rotate_right(count as u32);
+    *flags_changed &= !1 & !FLAG_OVERFLOW;
+    *flags = *flags & !1 & !FLAG_OVERFLOW
+        | (result >> 63) as i32
+        | ((((result >> 63) ^ (result >> 62)) & 1) as i32) << 11 & FLAG_OVERFLOW;
+    return result;
+}
+pub unsafe fn rcl64(dest_operand: u64, count: i32) -> u64 {
+    dbg_assert!(count >= 0 && count < 64);
+    if count == 0 {
+        return dest_operand;
+    }
+    let wide = dest_operand as u128 | (getcf() as u128) << 64;
+    let rotated = wide << count | wide >> (65 - count);
+    let result = rotated as u64;
+    let new_cf = (rotated >> 64 & 1) as i32;
+    *flags_changed &= !1 & !FLAG_OVERFLOW;
+    *flags = *flags & !1 & !FLAG_OVERFLOW
+        | new_cf
+        | ((new_cf ^ (result >> 63) as i32) << 11) & FLAG_OVERFLOW;
+    return result;
+}
+pub unsafe fn rcr64(dest_operand: u64, count: i32) -> u64 {
+    dbg_assert!(count >= 0 && count < 64);
+    if count == 0 {
+        return dest_operand;
+    }
+    let wide = dest_operand as u128 | (getcf() as u128) << 64;
+    let rotated = wide >> count | wide << (65 - count);
+    let result = rotated as u64;
+    let new_cf = (rotated >> 64 & 1) as i32;
+    *flags_changed &= !1 & !FLAG_OVERFLOW;
+    *flags = *flags & !1 & !FLAG_OVERFLOW
+        | new_cf
+        | ((((result >> 63) ^ (result >> 62)) & 1) as i32) << 11 & FLAG_OVERFLOW;
+    return result;
+}
+
+pub unsafe fn shld64(dest_operand: u64, source_operand: u64, count: i32) -> u64 {
+    dbg_assert!(count >= 0 && count < 64);
+    if count == 0 {
+        return dest_operand;
+    }
+    let result = dest_operand << count | source_operand >> (64 - count);
+    *last_result_64 = result;
+    *last_op_size = OPSIZE_64;
+    *flags_changed = FLAGS_ALL & !1 & !FLAG_OVERFLOW;
+    let b = (dest_operand >> (64 - count) & 1) as i32;
+    *flags = *flags & !1 & !FLAG_OVERFLOW
+        | b
+        | ((b ^ (result >> 63) as i32) << 11) & FLAG_OVERFLOW;
+    return result;
+}
+pub unsafe fn shrd64(dest_operand: u64, source_operand: u64, count: i32) -> u64 {
+    dbg_assert!(count >= 0 && count < 64);
+    if count == 0 {
+        return dest_operand;
+    }
+    let result = dest_operand >> count | source_operand << (64 - count);
+    *last_result_64 = result;
+    *last_op_size = OPSIZE_64;
+    *flags_changed = FLAGS_ALL & !1 & !FLAG_OVERFLOW;
+    *flags = *flags & !1 & !FLAG_OVERFLOW
+        | (dest_operand >> (count - 1) & 1) as i32
+        | (((result ^ dest_operand) >> 52) as i32) & FLAG_OVERFLOW;
+    return result;
+}
+
+pub unsafe fn div64_without_fault(source_operand: u64) -> bool {
+    let target = (read_reg64(EDX) as u128) << 64 | read_reg64(EAX) as u128;
+    let result = match target.checked_div(source_operand as u128) {
+        None => return false,
+        Some(r) => r,
+    };
+    if result > 0xFFFF_FFFF_FFFF_FFFF {
+        return false;
+    }
+    let modulo = target % source_operand as u128;
+    write_reg64(EAX, result as u64);
+    write_reg64(EDX, modulo as u64);
+    return true;
+}
+pub unsafe fn div64(source_operand: u64) {
+    if !div64_without_fault(source_operand) {
+        trigger_de()
+    }
+}
+pub unsafe fn idiv64_without_fault(source_operand: u64) -> bool {
+    let source = source_operand as i64 as i128;
+    if source == 0 {
+        return false;
+    }
+    let target =
+        (read_reg64(EDX) as i128) << 64 | (read_reg64(EAX) as i128) & 0xFFFF_FFFF_FFFF_FFFF;
+    let result = match target.checked_div(source) {
+        None => return false,
+        Some(r) => r,
+    };
+    if result < i64::MIN as i128 || result > i64::MAX as i128 {
+        return false;
+    }
+    let modulo = target % source;
+    write_reg64(EAX, result as u64);
+    write_reg64(EDX, modulo as u64);
+    return true;
+}
+pub unsafe fn idiv64(source_operand: u64) {
+    if !idiv64_without_fault(source_operand) {
+        trigger_de()
+    }
+}
+
+pub unsafe fn bsf64(old: u64, bit_base: u64) -> u64 {
+    *flags_changed = FLAGS_ALL & !FLAG_ZERO & !FLAG_CARRY;
+    *flags &= !FLAG_CARRY;
+    *last_op_size = OPSIZE_64;
+    if bit_base == 0 {
+        *flags |= FLAG_ZERO;
+        *last_result_64 = 0;
+        return old;
+    }
+    else {
+        *flags &= !FLAG_ZERO;
+        *last_result_64 = bit_base.trailing_zeros() as u64;
+        return *last_result_64;
+    };
+}
+pub unsafe fn bsr64(old: u64, bit_base: u64) -> u64 {
+    *flags_changed = FLAGS_ALL & !FLAG_ZERO & !FLAG_CARRY;
+    *flags &= !FLAG_CARRY;
+    *last_op_size = OPSIZE_64;
+    if bit_base == 0 {
+        *flags |= FLAG_ZERO;
+        *last_result_64 = 0;
+        return old;
+    }
+    else {
+        *flags &= !FLAG_ZERO;
+        *last_result_64 = 63 - bit_base.leading_zeros() as u64;
+        return *last_result_64;
+    };
+}
+
+pub unsafe fn bt_reg64(bit_base: u64, bit_offset: i32) {
+    *flags = *flags & !1 | (bit_base >> bit_offset & 1) as i32;
+    *flags_changed &= !1;
+}
+
+pub unsafe fn popcnt64(x: u64) -> u64 {
+    // all arithmetic flags are cleared; zf is set when the source is zero
+    *flags &= !(FLAG_CARRY | FLAG_PARITY | FLAG_ADJUST | FLAG_SIGN | FLAG_OVERFLOW | FLAG_ZERO);
+    *flags_changed &= !FLAGS_ALL;
+    if x == 0 {
+        *flags |= FLAG_ZERO;
+    }
+    x.count_ones() as u64
+}
+pub unsafe fn btc_reg64(bit_base: u64, bit_offset: i32) -> u64 {
+    *flags = *flags & !1 | (bit_base >> bit_offset & 1) as i32;
+    *flags_changed &= !1;
+    return bit_base ^ 1 << bit_offset;
+}
+pub unsafe fn bts_reg64(bit_base: u64, bit_offset: i32) -> u64 {
+    *flags = *flags & !1 | (bit_base >> bit_offset & 1) as i32;
+    *flags_changed &= !1;
+    return bit_base | 1 << bit_offset;
+}
+pub unsafe fn btr_reg64(bit_base: u64, bit_offset: i32) -> u64 {
+    *flags = *flags & !1 | (bit_base >> bit_offset & 1) as i32;
+    *flags_changed &= !1;
+    return bit_base & !(1u64 << bit_offset);
+}
+
 #[no_mangle]
 pub unsafe fn rol8(dest_operand: i32, mut count: i32) -> i32 {
     dbg_assert!(count >= 0 && count < 32);
@@ -648,7 +1026,7 @@ pub unsafe fn div8(source_operand: u32) {
         return;
     }
     write_reg8(AL, result as i32);
-    write_reg8(AH, (target_operand % source_operand) as i32);
+    write_reg8_legacy_high(AH, (target_operand % source_operand) as i32);
 }
 
 #[no_mangle]
@@ -664,7 +1042,7 @@ pub unsafe fn idiv8(source_operand: i32) {
         return;
     }
     write_reg8(AL, result);
-    write_reg8(AH, target_operand % source_operand);
+    write_reg8_legacy_high(AH, target_operand % source_operand);
 }
 
 #[no_mangle]
@@ -1015,30 +1393,30 @@ pub unsafe fn btr_reg(bit_base: i32, bit_offset: i32) -> i32 {
     return bit_base & !(1 << bit_offset);
 }
 
-pub unsafe fn bt_mem(virt_addr: i32, mut bit_offset: i32) {
-    let bit_base = return_on_pagefault!(safe_read8(virt_addr + (bit_offset >> 3)));
+pub unsafe fn bt_mem(virt_addr: u64, mut bit_offset: i32) {
+    let bit_base = return_on_pagefault!(safe_read8(virt_addr + (bit_offset >> 3) as u64));
     bit_offset &= 7;
     *flags = *flags & !1 | bit_base >> bit_offset & 1;
     *flags_changed &= !1;
 }
-pub unsafe fn btc_mem(virt_addr: i32, mut bit_offset: i32) {
-    let phys_addr = return_on_pagefault!(translate_address_write(virt_addr + (bit_offset >> 3)));
+pub unsafe fn btc_mem(virt_addr: u64, mut bit_offset: i32) {
+    let phys_addr = return_on_pagefault!(translate_address_write(virt_addr + (bit_offset >> 3) as u64));
     let bit_base = memory::read8(phys_addr);
     bit_offset &= 7;
     *flags = *flags & !1 | bit_base >> bit_offset & 1;
     *flags_changed &= !1;
     memory::write8(phys_addr, bit_base ^ 1 << bit_offset);
 }
-pub unsafe fn btr_mem(virt_addr: i32, mut bit_offset: i32) {
-    let phys_addr = return_on_pagefault!(translate_address_write(virt_addr + (bit_offset >> 3)));
+pub unsafe fn btr_mem(virt_addr: u64, mut bit_offset: i32) {
+    let phys_addr = return_on_pagefault!(translate_address_write(virt_addr + (bit_offset >> 3) as u64));
     let bit_base = memory::read8(phys_addr);
     bit_offset &= 7;
     *flags = *flags & !1 | bit_base >> bit_offset & 1;
     *flags_changed &= !1;
     memory::write8(phys_addr, bit_base & !(1 << bit_offset));
 }
-pub unsafe fn bts_mem(virt_addr: i32, mut bit_offset: i32) {
-    let phys_addr = return_on_pagefault!(translate_address_write(virt_addr + (bit_offset >> 3)));
+pub unsafe fn bts_mem(virt_addr: u64, mut bit_offset: i32) {
+    let phys_addr = return_on_pagefault!(translate_address_write(virt_addr + (bit_offset >> 3) as u64));
     let bit_base = memory::read8(phys_addr);
     bit_offset &= 7;
     *flags = *flags & !1 | bit_base >> bit_offset & 1;

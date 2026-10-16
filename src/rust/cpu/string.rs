@@ -9,14 +9,16 @@
 // ins    0    0   1/w
 // outs   0    1   0
 
-use crate::cpu::arith::{cmp16, cmp32, cmp8};
+use crate::cpu::arith::{cmp16, cmp32, cmp64, cmp8};
 use crate::cpu::cpu::{
-    get_seg, io_port_read16, io_port_read32, io_port_read8, io_port_write16, io_port_write32,
-    io_port_write8, read_reg16, read_reg32, safe_read16, safe_read32s, safe_read8, safe_write16,
-    safe_write32, safe_write8, set_reg_asize, test_privileges_for_io, translate_address_read,
+    get_seg64, io_port_read16, io_port_read32, io_port_read8, io_port_write16, io_port_write32,
+    io_port_write8, read_reg16, read_reg32, read_reg64, safe_read16, safe_read32s, safe_read64s,
+    safe_read8, safe_write16, safe_write32, safe_write64, safe_write8, set_reg_asize,
+    test_privileges_for_io, translate_address_read,
     translate_address_write_and_can_skip_dirty, writable_or_pagefault, write_reg16, write_reg32,
-    write_reg8, AL, AX, DX, EAX, ECX, EDI, ES, ESI, FLAG_DIRECTION,
+    write_reg64, write_reg8, AL, AX, DX, EAX, ECX, EDI, ES, ESI, FLAG_DIRECTION,
 };
+use crate::cpu::global_pointers::is_64;
 use crate::cpu::global_pointers::{flags, instruction_pointer, previous_ip};
 use crate::cpu::memory;
 use crate::jit;
@@ -46,6 +48,7 @@ enum Size {
     B,
     W,
     D,
+    Q,
 }
 #[derive(Copy, Clone)]
 enum Rep {
@@ -64,13 +67,30 @@ unsafe fn string_instruction(
     size: Size,
     rep: Rep,
 ) {
-    let asize_mask = if is_asize_32 { -1 } else { 0xFFFF };
+    // address size: 16 bit (mask 0xffff), 32 bit (mask 0xffffffff) or 64 bit
+    // (no mask). is_asize_32 is false in long mode with 64-bit addressing.
+    let asize_mask: u64 = if is_asize_32 {
+        0xFFFF_FFFF
+    }
+    else if *is_64 {
+        u64::MAX
+    }
+    else {
+        0xFFFF
+    };
+    // 16-bit addresses wrap around (used to disable the fast path below)
+    let is_asize_16 = !is_asize_32 && !*is_64;
 
     let direction = if 0 != *flags & FLAG_DIRECTION { -1 } else { 1 };
 
     let mut count = match rep {
         Rep::Z | Rep::NZ => {
-            let c = (read_reg32(ECX) & asize_mask) as u32;
+            let c = if *is_64 && !is_asize_32 {
+                read_reg64(ECX)
+            }
+            else {
+                read_reg32(ECX) as u32 as u64 & asize_mask
+            };
             if c == 0 {
                 return;
             };
@@ -84,7 +104,7 @@ unsafe fn string_instruction(
         | Instruction::Cmps
         | Instruction::Stos
         | Instruction::Scas
-        | Instruction::Ins => return_on_pagefault!(get_seg(ES)),
+        | Instruction::Ins => get_seg64(ES),
         _ => 0,
     };
     let ds = match instruction {
@@ -92,7 +112,7 @@ unsafe fn string_instruction(
         | Instruction::Cmps
         | Instruction::Lods
         | Instruction::Scas
-        | Instruction::Outs => return_on_pagefault!(get_seg(ds_or_prefix)),
+        | Instruction::Outs => get_seg64(ds_or_prefix),
         _ => 0,
     };
 
@@ -100,23 +120,37 @@ unsafe fn string_instruction(
         Size::B => 1,
         Size::W => 2,
         Size::D => 4,
+        Size::Q => 8,
     };
-    let size_mask = match size {
+    let size_mask: u64 = match size {
         Size::B => 0xFF,
         Size::W => 0xFFFF,
-        Size::D => -1,
+        Size::D => 0xFFFF_FFFF,
+        Size::Q => u64::MAX,
     };
 
     let increment = direction * size_bytes;
 
     let data = match instruction {
-        Instruction::Stos | Instruction::Scas => read_reg32(EAX),
+        Instruction::Stos | Instruction::Scas => {
+            if size == Size::Q {
+                read_reg64(EAX)
+            }
+            else {
+                read_reg32(EAX) as u32 as u64
+            }
+        },
         _ => 0,
     };
 
     let mut src = match instruction {
         Instruction::Movs | Instruction::Cmps | Instruction::Lods | Instruction::Outs => {
-            read_reg32(ESI) & asize_mask
+            if *is_64 && !is_asize_32 {
+                read_reg64(ESI)
+            }
+            else {
+                read_reg32(ESI) as u32 as u64 & asize_mask
+            }
         },
         _ => 0,
     };
@@ -125,7 +159,14 @@ unsafe fn string_instruction(
         | Instruction::Cmps
         | Instruction::Stos
         | Instruction::Scas
-        | Instruction::Ins => read_reg32(EDI) & asize_mask,
+        | Instruction::Ins => {
+            if *is_64 && !is_asize_32 {
+                read_reg64(EDI)
+            }
+            else {
+                read_reg32(EDI) as u32 as u64 & asize_mask
+            }
+        },
         _ => 0,
     };
 
@@ -140,18 +181,19 @@ unsafe fn string_instruction(
         _ => 0,
     };
 
-    let is_aligned = (ds + src) & (size_bytes - 1) == 0 && (es + dst) & (size_bytes - 1) == 0;
+    let is_aligned = (ds.wrapping_add(src)) & (size_bytes as u64 - 1) == 0
+        && (es.wrapping_add(dst)) & (size_bytes as u64 - 1) == 0;
 
     // unaligned movs is properly handled in the fast path
     let mut rep_fast = (instruction == Instruction::Movs || is_aligned)
-        && is_asize_32 // 16-bit address wraparound
+        && !is_asize_16 // 16-bit address wraparound
         && match rep {
             Rep::NZ | Rep::Z => true,
             Rep::None => false,
         };
 
-    let mut phys_dst = 0;
-    let mut phys_src = 0;
+    let mut phys_dst = 0u32;
+    let mut phys_src = 0u32;
     let mut skip_dirty_page = false;
 
     let mut movs_into_svga_lfb = false;
@@ -160,22 +202,24 @@ unsafe fn string_instruction(
     let count_until_end_of_page = if rep_fast {
         match instruction {
             Instruction::Movs => {
-                let (addr, skip) =
-                    return_on_pagefault!(translate_address_write_and_can_skip_dirty(es + dst));
+                let (addr, skip) = return_on_pagefault!(translate_address_write_and_can_skip_dirty(
+                    es.wrapping_add(dst)
+                ));
                 movs_into_svga_lfb = memory::in_svga_lfb(addr);
                 rep_fast = rep_fast && (!memory::in_mapped_range(addr) || movs_into_svga_lfb);
                 phys_dst = addr;
                 skip_dirty_page = skip;
             },
             Instruction::Stos | Instruction::Ins => {
-                let (addr, skip) =
-                    return_on_pagefault!(translate_address_write_and_can_skip_dirty(es + dst));
+                let (addr, skip) = return_on_pagefault!(translate_address_write_and_can_skip_dirty(
+                    es.wrapping_add(dst)
+                ));
                 rep_fast = rep_fast && !memory::in_mapped_range(addr);
                 phys_dst = addr;
                 skip_dirty_page = skip;
             },
             Instruction::Cmps | Instruction::Scas => {
-                let addr = return_on_pagefault!(translate_address_read(es + dst));
+                let addr = return_on_pagefault!(translate_address_read(es.wrapping_add(dst)));
                 rep_fast = rep_fast && !memory::in_mapped_range(addr);
                 phys_dst = addr;
                 skip_dirty_page = true;
@@ -185,7 +229,7 @@ unsafe fn string_instruction(
 
         match instruction {
             Instruction::Movs | Instruction::Cmps | Instruction::Lods | Instruction::Outs => {
-                let addr = return_on_pagefault!(translate_address_read(ds + src));
+                let addr = return_on_pagefault!(translate_address_read(ds.wrapping_add(src)));
                 rep_fast = rep_fast && !memory::in_mapped_range(addr);
                 phys_src = addr;
             },
@@ -193,7 +237,7 @@ unsafe fn string_instruction(
         };
 
         let count_until_end_of_page = u32::min(
-            count,
+            u32::try_from(count).unwrap_or(u32::MAX),
             match instruction {
                 Instruction::Movs | Instruction::Cmps => u32::min(
                     count_until_end_of_page(direction, size_bytes, phys_src),
@@ -257,41 +301,49 @@ unsafe fn string_instruction(
             let src_val = match instruction {
                 Instruction::Movs | Instruction::Cmps | Instruction::Lods | Instruction::Outs => {
                     match size {
-                        Size::B => memory::read8_no_mmap_check(phys_src),
-                        Size::W => memory::read16_no_mmap_check(phys_src),
-                        Size::D => memory::read32_no_mmap_check(phys_src),
+                        Size::B => memory::read8_no_mmap_check(phys_src) as u64,
+                        Size::W => memory::read16_no_mmap_check(phys_src) as u32 as u64,
+                        Size::D => memory::read32_no_mmap_check(phys_src) as u32 as u64,
+                        Size::Q => {
+                            memory::read64s(phys_src) as u64
+                        },
                     }
                 },
                 Instruction::Scas | Instruction::Stos => data & size_mask,
                 Instruction::Ins => match size {
-                    Size::B => io_port_read8(port),
-                    Size::W => io_port_read16(port),
-                    Size::D => io_port_read32(port),
+                    Size::B => io_port_read8(port) as u64,
+                    Size::W => io_port_read16(port) as u32 as u64,
+                    Size::D => io_port_read32(port) as u32 as u64,
+                    Size::Q => 0,
                 },
             };
 
-            let mut dst_val = 0;
+            let mut dst_val = 0u64;
 
             match instruction {
                 Instruction::Cmps | Instruction::Scas => match size {
-                    Size::B => dst_val = memory::read8_no_mmap_check(phys_dst),
-                    Size::W => dst_val = memory::read16_no_mmap_check(phys_dst),
-                    Size::D => dst_val = memory::read32_no_mmap_check(phys_dst),
+                    Size::B => dst_val = memory::read8_no_mmap_check(phys_dst) as u64,
+                    Size::W => dst_val = memory::read16_no_mmap_check(phys_dst) as u32 as u64,
+                    Size::D => dst_val = memory::read32_no_mmap_check(phys_dst) as u32 as u64,
+                    Size::Q => dst_val = memory::read64s(phys_dst) as u64,
                 },
                 Instruction::Outs => match size {
-                    Size::B => io_port_write8(port, src_val),
-                    Size::W => io_port_write16(port, src_val),
-                    Size::D => io_port_write32(port, src_val),
+                    Size::B => io_port_write8(port, src_val as i32),
+                    Size::W => io_port_write16(port, src_val as i32),
+                    Size::D => io_port_write32(port, src_val as i32),
+                    Size::Q => {},
                 },
                 Instruction::Lods => match size {
-                    Size::B => write_reg8(AL, src_val),
-                    Size::W => write_reg16(AX, src_val),
-                    Size::D => write_reg32(EAX, src_val),
+                    Size::B => write_reg8(AL, src_val as i32),
+                    Size::W => write_reg16(AX, src_val as i32),
+                    Size::D => write_reg32(EAX, src_val as i32),
+                    Size::Q => write_reg64(EAX, src_val),
                 },
                 Instruction::Ins => match size {
-                    Size::B => memory::write8_no_mmap_or_dirty_check(phys_dst, src_val),
-                    Size::W => memory::write16_no_mmap_or_dirty_check(phys_dst, src_val),
-                    Size::D => memory::write32_no_mmap_or_dirty_check(phys_dst, src_val),
+                    Size::B => memory::write8_no_mmap_or_dirty_check(phys_dst, src_val as i32),
+                    Size::W => memory::write16_no_mmap_or_dirty_check(phys_dst, src_val as i32),
+                    Size::D => memory::write32_no_mmap_or_dirty_check(phys_dst, src_val as i32),
+                    Size::Q => {},
                 },
                 Instruction::Movs => {
                     if direction == -1 {
@@ -328,8 +380,9 @@ unsafe fn string_instruction(
                         i = count_until_end_of_page;
                         break;
                     },
-                    Size::W => memory::write16_no_mmap_or_dirty_check(phys_dst, src_val),
-                    Size::D => memory::write32_no_mmap_or_dirty_check(phys_dst, src_val),
+                    Size::W => memory::write16_no_mmap_or_dirty_check(phys_dst, src_val as i32),
+                    Size::D => memory::write32_no_mmap_or_dirty_check(phys_dst, src_val as i32),
+                    Size::Q => memory::write64_no_mmap_or_dirty_check(phys_dst, src_val),
                 },
             };
 
@@ -339,13 +392,13 @@ unsafe fn string_instruction(
                 | Instruction::Stos
                 | Instruction::Scas
                 | Instruction::Ins => {
-                    phys_dst += increment as u32;
+                    phys_dst = phys_dst.wrapping_add(increment as u64 as u32);
                 },
                 _ => {},
             }
             match instruction {
                 Instruction::Movs | Instruction::Cmps | Instruction::Lods | Instruction::Outs => {
-                    phys_src += increment as u32;
+                    phys_src = phys_src.wrapping_add(increment as u64 as u32);
                 },
                 _ => {},
             };
@@ -360,11 +413,12 @@ unsafe fn string_instruction(
                             true
                         },
                     };
-                    if !rep_cmp || count == i {
+                    if !rep_cmp || count == i as u64 {
                         match size {
-                            Size::B => cmp8(src_val, dst_val),
-                            Size::W => cmp16(src_val, dst_val),
-                            Size::D => cmp32(src_val, dst_val),
+                            Size::B => cmp8(src_val as i32, dst_val as i32),
+                            Size::W => cmp16(src_val as i32, dst_val as i32),
+                            Size::D => cmp32(src_val as i32, dst_val as i32),
+                            Size::Q => cmp64(src_val, dst_val),
                         };
                         rep_cmp_finished = true;
                         break;
@@ -374,16 +428,16 @@ unsafe fn string_instruction(
             }
         }
 
-        dbg_assert!(i <= count);
-        count -= i;
+        dbg_assert!(i as u64 <= count);
+        count -= i as u64;
 
         if !rep_cmp_finished && count != 0 {
             // go back to the current instruction, since this loop just handles a single page
             *instruction_pointer = *previous_ip;
         }
 
-        src += i as i32 * increment;
-        dst += i as i32 * increment;
+        src = src.wrapping_add((i as i64 * increment as i64) as u64);
+        dst = dst.wrapping_add((i as i64 * increment as i64) as u64);
     }
     else {
         loop {
@@ -391,48 +445,70 @@ unsafe fn string_instruction(
                 Instruction::Ins => {
                     // check fault *before* reading from port
                     // (technically not necessary according to Intel manuals)
-                    break_on_pagefault!(writable_or_pagefault(es + dst, size_bytes));
+                    break_on_pagefault!(writable_or_pagefault(
+                        es.wrapping_add(dst),
+                        size_bytes
+                    ));
                 },
                 _ => {},
             };
             let src_val = match instruction {
                 Instruction::Movs | Instruction::Cmps | Instruction::Lods | Instruction::Outs => {
                     break_on_pagefault!(match size {
-                        Size::B => safe_read8(ds + src),
-                        Size::W => safe_read16(ds + src),
-                        Size::D => safe_read32s(ds + src),
+                        Size::B => safe_read8(ds.wrapping_add(src)).map(|v| v as u64),
+                        Size::W => safe_read16(ds.wrapping_add(src)).map(|v| v as u32 as u64),
+                        Size::D => safe_read32s(ds.wrapping_add(src)).map(|v| v as u32 as u64),
+                        Size::Q => safe_read64s(ds.wrapping_add(src)),
                     })
                 },
                 Instruction::Scas | Instruction::Stos => data & size_mask,
                 Instruction::Ins => match size {
-                    Size::B => io_port_read8(port),
-                    Size::W => io_port_read16(port),
-                    Size::D => io_port_read32(port),
+                    Size::B => io_port_read8(port) as u64,
+                    Size::W => io_port_read16(port) as u32 as u64,
+                    Size::D => io_port_read32(port) as u32 as u64,
+                    Size::Q => 0,
                 },
             };
 
-            let mut dst_val = 0;
+            let mut dst_val = 0u64;
 
             match instruction {
                 Instruction::Cmps | Instruction::Scas => match size {
-                    Size::B => dst_val = break_on_pagefault!(safe_read8(es + dst)),
-                    Size::W => dst_val = break_on_pagefault!(safe_read16(es + dst)),
-                    Size::D => dst_val = break_on_pagefault!(safe_read32s(es + dst)),
+                    Size::B => {
+                        dst_val = break_on_pagefault!(safe_read8(es.wrapping_add(dst))) as u64
+                    },
+                    Size::W => {
+                        dst_val = break_on_pagefault!(safe_read16(es.wrapping_add(dst))) as u32 as u64
+                    },
+                    Size::D => {
+                        dst_val =
+                            break_on_pagefault!(safe_read32s(es.wrapping_add(dst))) as u32 as u64
+                    },
+                    Size::Q => {
+                        dst_val = break_on_pagefault!(safe_read64s(es.wrapping_add(dst)))
+                    },
                 },
                 Instruction::Outs => match size {
-                    Size::B => io_port_write8(port, src_val),
-                    Size::W => io_port_write16(port, src_val),
-                    Size::D => io_port_write32(port, src_val),
+                    Size::B => io_port_write8(port, src_val as i32),
+                    Size::W => io_port_write16(port, src_val as i32),
+                    Size::D => io_port_write32(port, src_val as i32),
+                    Size::Q => {},
                 },
                 Instruction::Lods => match size {
-                    Size::B => write_reg8(AL, src_val),
-                    Size::W => write_reg16(AX, src_val),
-                    Size::D => write_reg32(EAX, src_val),
+                    Size::B => write_reg8(AL, src_val as i32),
+                    Size::W => write_reg16(AX, src_val as i32),
+                    Size::D => write_reg32(EAX, src_val as i32),
+                    Size::Q => write_reg64(EAX, src_val),
                 },
                 Instruction::Movs | Instruction::Stos | Instruction::Ins => match size {
-                    Size::B => break_on_pagefault!(safe_write8(es + dst, src_val)),
-                    Size::W => break_on_pagefault!(safe_write16(es + dst, src_val)),
-                    Size::D => break_on_pagefault!(safe_write32(es + dst, src_val)),
+                    Size::B => break_on_pagefault!(safe_write8(es.wrapping_add(dst), src_val as i32)),
+                    Size::W => {
+                        break_on_pagefault!(safe_write16(es.wrapping_add(dst), src_val as i32))
+                    },
+                    Size::D => {
+                        break_on_pagefault!(safe_write32(es.wrapping_add(dst), src_val as i32))
+                    },
+                    Size::Q => break_on_pagefault!(safe_write64(es.wrapping_add(dst), src_val)),
                 },
             };
 
@@ -441,12 +517,14 @@ unsafe fn string_instruction(
                 | Instruction::Cmps
                 | Instruction::Stos
                 | Instruction::Scas
-                | Instruction::Ins => dst = dst + increment & asize_mask,
+                | Instruction::Ins => {
+                    dst = dst.wrapping_add(increment as i64 as u64) & asize_mask
+                },
                 _ => {},
             }
             match instruction {
                 Instruction::Movs | Instruction::Cmps | Instruction::Lods | Instruction::Outs => {
-                    src = src + increment & asize_mask
+                    src = src.wrapping_add(increment as i64 as u64) & asize_mask
                 },
                 _ => {},
             };
@@ -479,9 +557,10 @@ unsafe fn string_instruction(
             if finished {
                 match instruction {
                     Instruction::Scas | Instruction::Cmps => match size {
-                        Size::B => cmp8(src_val, dst_val),
-                        Size::W => cmp16(src_val, dst_val),
-                        Size::D => cmp32(src_val, dst_val),
+                        Size::B => cmp8(src_val as i32, dst_val as i32),
+                        Size::W => cmp16(src_val as i32, dst_val as i32),
+                        Size::D => cmp32(src_val as i32, dst_val as i32),
+                        Size::Q => cmp64(src_val, dst_val),
                     },
                     _ => {},
                 }
@@ -507,7 +586,7 @@ unsafe fn string_instruction(
 
     match rep {
         Rep::Z | Rep::NZ => {
-            set_reg_asize(is_asize_32, ECX, count as i32);
+            set_reg_asize(is_asize_32, ECX, count);
         },
         Rep::None => {},
     }
@@ -525,6 +604,9 @@ pub unsafe fn movsw_rep(is_asize_32: bool, seg: i32) {
 pub unsafe fn movsd_rep(is_asize_32: bool, seg: i32) {
     string_instruction(is_asize_32, seg, Instruction::Movs, Size::D, Rep::Z)
 }
+pub unsafe fn movsq_rep(is_asize_32: bool, seg: i32) {
+    string_instruction(is_asize_32, seg, Instruction::Movs, Size::Q, Rep::Z)
+}
 pub unsafe fn movsb_no_rep(is_asize_32: bool, seg: i32) {
     string_instruction(is_asize_32, seg, Instruction::Movs, Size::B, Rep::None)
 }
@@ -533,6 +615,9 @@ pub unsafe fn movsw_no_rep(is_asize_32: bool, seg: i32) {
 }
 pub unsafe fn movsd_no_rep(is_asize_32: bool, seg: i32) {
     string_instruction(is_asize_32, seg, Instruction::Movs, Size::D, Rep::None)
+}
+pub unsafe fn movsq_no_rep(is_asize_32: bool, seg: i32) {
+    string_instruction(is_asize_32, seg, Instruction::Movs, Size::Q, Rep::None)
 }
 
 #[no_mangle]
@@ -547,6 +632,9 @@ pub unsafe fn lodsw_rep(is_asize_32: bool, seg: i32) {
 pub unsafe fn lodsd_rep(is_asize_32: bool, seg: i32) {
     string_instruction(is_asize_32, seg, Instruction::Lods, Size::D, Rep::Z)
 }
+pub unsafe fn lodsq_rep(is_asize_32: bool, seg: i32) {
+    string_instruction(is_asize_32, seg, Instruction::Lods, Size::Q, Rep::Z)
+}
 pub unsafe fn lodsb_no_rep(is_asize_32: bool, seg: i32) {
     string_instruction(is_asize_32, seg, Instruction::Lods, Size::B, Rep::None)
 }
@@ -555,6 +643,9 @@ pub unsafe fn lodsw_no_rep(is_asize_32: bool, seg: i32) {
 }
 pub unsafe fn lodsd_no_rep(is_asize_32: bool, seg: i32) {
     string_instruction(is_asize_32, seg, Instruction::Lods, Size::D, Rep::None)
+}
+pub unsafe fn lodsq_no_rep(is_asize_32: bool, seg: i32) {
+    string_instruction(is_asize_32, seg, Instruction::Lods, Size::Q, Rep::None)
 }
 
 #[no_mangle]
@@ -569,6 +660,9 @@ pub unsafe fn stosw_rep(is_asize_32: bool) {
 pub unsafe fn stosd_rep(is_asize_32: bool) {
     string_instruction(is_asize_32, 0, Instruction::Stos, Size::D, Rep::Z)
 }
+pub unsafe fn stosq_rep(is_asize_32: bool) {
+    string_instruction(is_asize_32, 0, Instruction::Stos, Size::Q, Rep::Z)
+}
 pub unsafe fn stosb_no_rep(is_asize_32: bool) {
     string_instruction(is_asize_32, 0, Instruction::Stos, Size::B, Rep::None)
 }
@@ -577,6 +671,9 @@ pub unsafe fn stosw_no_rep(is_asize_32: bool) {
 }
 pub unsafe fn stosd_no_rep(is_asize_32: bool) {
     string_instruction(is_asize_32, 0, Instruction::Stos, Size::D, Rep::None)
+}
+pub unsafe fn stosq_no_rep(is_asize_32: bool) {
+    string_instruction(is_asize_32, 0, Instruction::Stos, Size::Q, Rep::None)
 }
 
 #[no_mangle]
@@ -591,6 +688,9 @@ pub unsafe fn cmpsw_repz(is_asize_32: bool, seg: i32) {
 pub unsafe fn cmpsd_repz(is_asize_32: bool, seg: i32) {
     string_instruction(is_asize_32, seg, Instruction::Cmps, Size::D, Rep::Z)
 }
+pub unsafe fn cmpsq_repz(is_asize_32: bool, seg: i32) {
+    string_instruction(is_asize_32, seg, Instruction::Cmps, Size::Q, Rep::Z)
+}
 #[no_mangle]
 pub unsafe fn cmpsb_repnz(is_asize_32: bool, seg: i32) {
     string_instruction(is_asize_32, seg, Instruction::Cmps, Size::B, Rep::NZ)
@@ -603,6 +703,9 @@ pub unsafe fn cmpsw_repnz(is_asize_32: bool, seg: i32) {
 pub unsafe fn cmpsd_repnz(is_asize_32: bool, seg: i32) {
     string_instruction(is_asize_32, seg, Instruction::Cmps, Size::D, Rep::NZ)
 }
+pub unsafe fn cmpsq_repnz(is_asize_32: bool, seg: i32) {
+    string_instruction(is_asize_32, seg, Instruction::Cmps, Size::Q, Rep::NZ)
+}
 #[no_mangle]
 pub unsafe fn cmpsb_no_rep(is_asize_32: bool, seg: i32) {
     string_instruction(is_asize_32, seg, Instruction::Cmps, Size::B, Rep::None)
@@ -614,6 +717,9 @@ pub unsafe fn cmpsw_no_rep(is_asize_32: bool, seg: i32) {
 #[no_mangle]
 pub unsafe fn cmpsd_no_rep(is_asize_32: bool, seg: i32) {
     string_instruction(is_asize_32, seg, Instruction::Cmps, Size::D, Rep::None)
+}
+pub unsafe fn cmpsq_no_rep(is_asize_32: bool, seg: i32) {
+    string_instruction(is_asize_32, seg, Instruction::Cmps, Size::Q, Rep::None)
 }
 
 #[no_mangle]
@@ -628,6 +734,9 @@ pub unsafe fn scasw_repz(is_asize_32: bool) {
 pub unsafe fn scasd_repz(is_asize_32: bool) {
     string_instruction(is_asize_32, 0, Instruction::Scas, Size::D, Rep::Z)
 }
+pub unsafe fn scasq_repz(is_asize_32: bool) {
+    string_instruction(is_asize_32, 0, Instruction::Scas, Size::Q, Rep::Z)
+}
 #[no_mangle]
 pub unsafe fn scasb_repnz(is_asize_32: bool) {
     string_instruction(is_asize_32, 0, Instruction::Scas, Size::B, Rep::NZ)
@@ -640,6 +749,9 @@ pub unsafe fn scasw_repnz(is_asize_32: bool) {
 pub unsafe fn scasd_repnz(is_asize_32: bool) {
     string_instruction(is_asize_32, 0, Instruction::Scas, Size::D, Rep::NZ)
 }
+pub unsafe fn scasq_repnz(is_asize_32: bool) {
+    string_instruction(is_asize_32, 0, Instruction::Scas, Size::Q, Rep::NZ)
+}
 pub unsafe fn scasb_no_rep(is_asize_32: bool) {
     string_instruction(is_asize_32, 0, Instruction::Scas, Size::B, Rep::None)
 }
@@ -648,6 +760,9 @@ pub unsafe fn scasw_no_rep(is_asize_32: bool) {
 }
 pub unsafe fn scasd_no_rep(is_asize_32: bool) {
     string_instruction(is_asize_32, 0, Instruction::Scas, Size::D, Rep::None)
+}
+pub unsafe fn scasq_no_rep(is_asize_32: bool) {
+    string_instruction(is_asize_32, 0, Instruction::Scas, Size::Q, Rep::None)
 }
 
 #[no_mangle]

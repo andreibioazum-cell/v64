@@ -409,8 +409,8 @@ else {
 
         if(!current_test.fixture.exception)
         {
-            for(let i = 0; i < cpu.reg32.length; i++) {
-                let reg = cpu.reg32[i];
+            for(let i = 0; i < 8; i++) {
+                let reg = cpu.get_reg32(i);
                 if(reg !== expected_reg32[i]) {
                     individual_failures.push({
                         name: "cpu.reg32[" + i + "]",

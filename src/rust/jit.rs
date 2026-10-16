@@ -20,7 +20,7 @@ use crate::page::Page;
 use crate::profiler;
 use crate::profiler::stat;
 use crate::state_flags::CachedStateFlags;
-use crate::wasmgen::wasm_builder::{Label, WasmBuilder, WasmLocal};
+use crate::wasmgen::wasm_builder::{Label, WasmBuilder, WasmLocal, WasmLocalI64};
 
 #[derive(Copy, Clone, Eq, Hash, PartialEq)]
 #[repr(transparent)]
@@ -60,6 +60,8 @@ pub fn jit_clear_func(wasm_table_index: WasmTableIndex) {
 }
 
 static mut JIT_DISABLED: bool = false;
+// compile 64-bit code (see jit64.rs); when disabled, 64-bit code runs in the interpreter
+static mut JIT64_DISABLED: bool = false;
 
 // Maximum number of pages per wasm module. Necessary for the following reasons:
 // - There is an upper limit on the size of a single function in wasm (currently ~7MB in all browsers)
@@ -74,6 +76,8 @@ static mut JIT_USE_LOOP_SAFETY: bool = true;
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 
 pub const JIT_THRESHOLD: u32 = 200 * 1000;
+// can be lowered for tests
+static mut JIT_HOTNESS_THRESHOLD: u32 = JIT_THRESHOLD;
 
 // less branches will generate if-else, more will generate brtable
 pub const BRTABLE_CUTOFF: usize = 10;
@@ -191,6 +195,10 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
 
     for i in 0..unsafe { cpu::valid_tlb_entries_count } {
         let page = unsafe { cpu::valid_tlb_entries[i as usize] };
+        // pages >= 4 GiB live in the secondary TLB and never hold jittered code
+        if page >= 0x10_0000 {
+            continue;
+        }
         let entry = unsafe { cpu::tlb_data[page as usize] };
         if 0 != entry {
             let tlb_physical_page = Page::of_u32(
@@ -252,7 +260,8 @@ pub enum BasicBlockType {
 
 pub struct BasicBlock {
     pub addr: u32,
-    pub virt_addr: i32,
+    /// virtual address (64-bit in long mode)
+    pub virt_addr: u64,
     pub last_instruction_addr: u32,
     pub end_addr: u32,
     pub is_entry_block: bool,
@@ -347,6 +356,14 @@ pub struct JitContext<'a> {
     pub previous_instruction: Instruction,
     pub instruction_counter: WasmLocal,
     pub wasm_table_index: WasmTableIndex,
+    /// 64-bit jit: the operation that last set the lazy flags in the current block, if known
+    pub flags64: crate::jit64::Flags64,
+    /// 64-bit jit: the 16 general purpose registers
+    pub register_locals64: Vec<WasmLocalI64>,
+    /// 64-bit jit: registers whose local may differ from memory (bitmask, within a block)
+    pub dirty_registers64: u16,
+    /// 64-bit jit: the (physical) end address of the current basic block
+    pub block_end: u32,
 }
 impl<'a> JitContext<'a> {
     pub fn reg(&self, i: u32) -> WasmLocal {
@@ -408,7 +425,53 @@ pub fn jit_find_cache_entry_in_page(
     let state_flags = CachedStateFlags::of_u32(state_flags);
 
     unsafe {
-        match cpu::tlb_code[(virt_address >> 12) as usize] {
+        match cpu::tlb_code_get(virt_address as u64 >> 12) {
+            None => {},
+            Some(c) => {
+                let c = c.as_ref();
+                if state_flags == c.state_flags && wasm_table_index == c.wasm_table_index {
+                    let state = c.state_table[virt_address as usize & 0xFFF];
+                    if state != u16::MAX {
+                        return state.into();
+                    }
+                }
+            },
+        }
+    }
+
+    profiler::stat_increment(stat::INDIRECT_JUMP_NO_ENTRY);
+
+    return -1;
+}
+
+/// The target of a relative jump from virt_addr (the end of the jump instruction)
+fn jump_target(cpu: &CpuContext, virt_addr: u64, offset: i32, is_32: bool) -> u64 {
+    if cpu.state_flags.is_64() {
+        dbg_assert!(is_32);
+        virt_addr.wrapping_add(offset as i64 as u64)
+    }
+    else if is_32 {
+        (virt_addr as u32).wrapping_add(offset as u32) as u64
+    }
+    else {
+        let cs_offset = cpu.cs_offset;
+        cs_offset.wrapping_add((virt_addr as u32).wrapping_sub(cs_offset).wrapping_add(offset as u32) & 0xFFFF)
+            as u64
+    }
+}
+
+#[no_mangle]
+pub fn jit_find_cache_entry_in_page64(
+    virt_address: u64,
+    wasm_table_index: WasmTableIndex,
+    state_flags: u32,
+) -> i32 {
+    profiler::stat_increment(stat::INDIRECT_JUMP);
+
+    let state_flags = CachedStateFlags::of_u32(state_flags);
+
+    unsafe {
+        match cpu::tlb_code_get(cpu::canonicalize_address(virt_address) >> 12) {
             None => {},
             Some(c) => {
                 let c = c.as_ref();
@@ -429,17 +492,17 @@ pub fn jit_find_cache_entry_in_page(
 
 fn jit_find_basic_blocks(
     ctx: &mut JitState,
-    entry_points: HashSet<i32>,
+    entry_points: HashSet<u64>,
     cpu: CpuContext,
 ) -> Vec<BasicBlock> {
     fn follow_jump(
-        virt_target: i32,
+        virt_target: u64,
         ctx: &mut JitState,
         pages: &mut HashSet<Page>,
         page_blacklist: &mut HashSet<Page>,
         max_pages: u32,
-        marked_as_entry: &mut HashSet<i32>,
-        to_visit_stack: &mut Vec<i32>,
+        marked_as_entry: &mut HashSet<u64>,
+        to_visit_stack: &mut Vec<u64>,
     ) -> Option<u32> {
         if is_near_end_of_page(virt_target as u32) {
             return None;
@@ -488,7 +551,7 @@ fn jit_find_basic_blocks(
                 *hotness = 0;
 
                 for &addr_low in entry_points.iter() {
-                    let addr = virt_target & !0xFFF | addr_low as i32;
+                    let addr = virt_target & !0xFFF | addr_low as u64;
                     to_visit_stack.push(addr);
                     marked_as_entry.insert(addr);
                 }
@@ -507,14 +570,19 @@ fn jit_find_basic_blocks(
         Some(phys_target)
     }
 
-    let mut to_visit_stack: Vec<i32> = Vec::new();
-    let mut marked_as_entry: HashSet<i32> = HashSet::new();
+    let mut to_visit_stack: Vec<u64> = Vec::new();
+    let mut marked_as_entry: HashSet<u64> = HashSet::new();
     let mut basic_blocks: BTreeMap<u32, BasicBlock> = BTreeMap::new();
     let mut pages: HashSet<Page> = HashSet::new();
     let mut page_blacklist = HashSet::new();
 
     // 16-bit doesn't work correctly, most likely due to instruction pointer wrap-around
-    let max_pages = if cpu.state_flags.is_32() { unsafe { MAX_PAGES } } else { 1 };
+    let max_pages = if cpu.state_flags.is_32() || cpu.state_flags.is_64() {
+        unsafe { MAX_PAGES }
+    }
+    else {
+        1
+    };
 
     for virt_addr in entry_points {
         let ok = follow_jump(
@@ -571,7 +639,7 @@ fn jit_find_basic_blocks(
             current_address = cpu.eip;
 
             dbg_assert!(Page::page_of(current_address) == Page::page_of(addr_before_instruction));
-            let current_virt_addr = to_visit & !0xFFF | current_address as i32 & 0xFFF;
+            let current_virt_addr = to_visit & !0xFFF | current_address as u64 & 0xFFF;
 
             if analysis.ty == AnalysisType::STI && is_near_end_of_page(current_address) {
                 // cut off before the STI so that it is handled by interpreted mode
@@ -628,13 +696,7 @@ fn jit_find_basic_blocks(
                     dbg_assert!(!analysis.absolute_jump);
                     // conditional jump: continue at next and continue at jump target
 
-                    let jump_target = if is_32 {
-                        current_virt_addr + offset
-                    }
-                    else {
-                        cpu.cs_offset as i32
-                            + (current_virt_addr - cpu.cs_offset as i32 + offset & 0xFFFF)
-                    };
+                    let jump_target = jump_target(&cpu, current_virt_addr, offset, is_32);
 
                     dbg_assert!(has_next_instruction);
                     to_visit_stack.push(current_virt_addr);
@@ -672,13 +734,7 @@ fn jit_find_basic_blocks(
                     dbg_assert!(!analysis.absolute_jump);
                     // non-conditional jump: continue at jump target
 
-                    let jump_target = if is_32 {
-                        current_virt_addr + offset
-                    }
-                    else {
-                        cpu.cs_offset as i32
-                            + (current_virt_addr - cpu.cs_offset as i32 + offset & 0xFFFF)
-                    };
+                    let jump_target = jump_target(&cpu, current_virt_addr, offset, is_32);
 
                     if has_next_instruction {
                         // Execution will eventually come back to the next instruction (CALL)
@@ -827,8 +883,8 @@ pub fn jit_force_generate_unsafe(virt_addr: i32) {
         "cannot force compile near end of page"
     );
     jit_increase_hotness_and_maybe_compile(
-        virt_addr,
-        cpu::translate_address_read(virt_addr).unwrap(),
+        virt_addr as u32 as u64,
+        cpu::translate_address_read(virt_addr as u32 as u64).unwrap(),
         cpu::get_seg_cs() as u32,
         cpu::get_state_flags(),
         JIT_THRESHOLD,
@@ -839,7 +895,7 @@ pub fn jit_force_generate_unsafe(virt_addr: i32) {
 #[inline(never)]
 fn jit_analyze_and_generate(
     ctx: &mut JitState,
-    virt_entry_point: i32,
+    virt_entry_point: u64,
     phys_entry_point: u32,
     cs_offset: u32,
     state_flags: CachedStateFlags,
@@ -889,11 +945,8 @@ fn jit_analyze_and_generate(
     dbg_assert!(
         cpu::translate_address_read_no_side_effects(virt_entry_point).unwrap() == phys_entry_point
     );
-    let virt_page = Page::page_of(virt_entry_point as u32);
-    let entry_points: HashSet<i32> = entry_points
-        .iter()
-        .map(|e| virt_page.to_address() as i32 | *e as i32)
-        .collect();
+    let virt_page = virt_entry_point & !0xFFF;
+    let entry_points: HashSet<u64> = entry_points.iter().map(|e| virt_page | *e as u64).collect();
     let basic_blocks = jit_find_basic_blocks(ctx, entry_points, cpu.clone());
 
     let mut pages = HashSet::new();
@@ -1106,19 +1159,14 @@ pub fn codegen_finalize_finished(
     };
 
     for i in 0..unsafe { cpu::valid_tlb_entries_count } {
-        let page = unsafe { cpu::valid_tlb_entries[i as usize] };
-        let entry = unsafe { cpu::tlb_data[page as usize] };
+        let page = unsafe { cpu::valid_tlb_entries[i as usize] } as u64;
+        let entry = unsafe { cpu::tlb_pick_entry(page << 12) };
         if 0 != entry {
             let tlb_physical_page = Page::of_u32(
-                (entry as u32 >> 12 ^ page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
+                ((entry >> 12 ^ page) as u32).wrapping_sub(unsafe { memory::mem8 } as u32 >> 12),
             );
             if let Some(info) = pages.get(&tlb_physical_page) {
-                set_tlb_code(
-                    Page::of_u32(page as u32),
-                    wasm_table_index,
-                    &info.entry_points,
-                    state_flags,
-                );
+                set_tlb_code(page, wasm_table_index, &info.entry_points, state_flags);
             }
         }
     }
@@ -1160,7 +1208,8 @@ pub fn codegen_finalize_finished(
     check_jit_state_invariants(&mut ctx);
 }
 
-pub fn update_tlb_code(virt_page: Page, phys_page: Page) {
+/// virt_page: the (up to 36-bit) page number of the virtual page
+pub fn update_tlb_code(virt_page: u64, phys_page: Page) {
     let ctx = get_jit_state();
 
     match ctx.pages.get(&phys_page) {
@@ -1170,17 +1219,25 @@ pub fn update_tlb_code(virt_page: Page, phys_page: Page) {
             state_flags,
             hidden_wasm_table_indices: _,
         }) => set_tlb_code(virt_page, *wasm_table_index, entry_points, *state_flags),
-        None => cpu::clear_tlb_code(virt_page.to_u32() as i32),
+        None => cpu::clear_tlb_code(virt_page),
     };
 }
 
+/// virt_page: the (up to 36-bit) page number of the virtual page, which must be in the TLB
 pub fn set_tlb_code(
-    virt_page: Page,
+    virt_page: u64,
     wasm_table_index: WasmTableIndex,
     entries: &Vec<(u16, u16)>,
     state_flags: CachedStateFlags,
 ) {
-    let c = match unsafe { cpu::tlb_code[virt_page.to_u32() as usize] } {
+    let slot = match unsafe { cpu::tlb_code_slot(virt_page) } {
+        Some(slot) => slot,
+        None => {
+            dbg_assert!(false, "set_tlb_code: page not in tlb");
+            return;
+        },
+    };
+    let c = match *slot {
         None => {
             let state_table = [u16::MAX; 0x1000];
             unsafe {
@@ -1189,7 +1246,7 @@ pub fn set_tlb_code(
                     state_flags,
                     state_table,
                 })));
-                cpu::tlb_code[virt_page.to_u32() as usize] = Some(c);
+                *slot = Some(c);
                 c.as_mut()
             }
         },
@@ -1218,12 +1275,29 @@ fn jit_generate_module(
 ) -> Vec<(u32, u16)> {
     builder.reset();
 
-    let mut register_locals = (0..8)
-        .map(|i| {
-            builder.load_fixed_i32(global_pointers::get_reg32_offset(i));
-            builder.set_new_local()
-        })
-        .collect();
+    // the 64-bit jit keeps registers in i64 locals (register_locals64)
+    let register_locals64: Vec<WasmLocalI64> = if state_flags.is_64() {
+        (0..16)
+            .map(|i| {
+                builder.load_fixed_i64(global_pointers::get_reg64_offset(i));
+                builder.set_new_local_i64()
+            })
+            .collect()
+    }
+    else {
+        Vec::new()
+    };
+    let mut register_locals = if state_flags.is_64() {
+        Vec::new()
+    }
+    else {
+        (0..8)
+            .map(|i| {
+                builder.load_fixed_i32(global_pointers::get_reg32_offset(i));
+                builder.set_new_local()
+            })
+            .collect()
+    };
 
     builder.const_i32(0);
     let instruction_counter = builder.set_new_local();
@@ -1258,6 +1332,10 @@ fn jit_generate_module(
         previous_instruction: Instruction::Other,
         instruction_counter,
         wasm_table_index,
+        flags64: crate::jit64::Flags64::Unknown,
+        register_locals64,
+        dirty_registers64: 0xFFFF,
+        block_end: 0,
     };
 
     let entry_blocks = {
@@ -1348,7 +1426,7 @@ fn jit_generate_module(
                             codegen::gen_condition_fn(ctx, condition);
                             ctx.builder.if_void();
                             if jump_offset_is_32 {
-                                codegen::gen_relative_jump(ctx.builder, jump_offset);
+                                codegen::gen_relative_jump_ctx(ctx, jump_offset);
                             }
                             else {
                                 codegen::gen_jmp_rel16(ctx.builder, jump_offset as u16);
@@ -1361,8 +1439,7 @@ fn jit_generate_module(
                             ..
                         } => {
                             if jump_offset_is_32 {
-                                codegen::gen_set_eip_low_bits_and_jump_rel32(
-                                    ctx.builder,
+                                codegen::gen_set_eip_low_bits_and_jump_rel(ctx,
                                     block.end_addr as i32 & 0xFFF,
                                     jump_offset,
                                 );
@@ -1395,10 +1472,19 @@ fn jit_generate_module(
                     },
                     BasicBlockType::AbsoluteEip => {
                         // Check if we can stay in this module, if not exit
-                        codegen::gen_get_eip(ctx.builder);
-                        ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
-                        ctx.builder.const_i32(state_flags.to_u32() as i32);
-                        ctx.builder.call_fn3_ret("jit_find_cache_entry_in_page");
+                        if state_flags.is_64() {
+                            codegen::gen_get_eip64(ctx.builder);
+                            ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
+                            ctx.builder.const_i32(state_flags.to_u32() as i32);
+                            ctx.builder
+                                .call_fn3_i64_i32_i32_ret("jit_find_cache_entry_in_page64");
+                        }
+                        else {
+                            codegen::gen_get_eip(ctx.builder);
+                            ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
+                            ctx.builder.const_i32(state_flags.to_u32() as i32);
+                            ctx.builder.call_fn3_ret("jit_find_cache_entry_in_page");
+                        }
                         ctx.builder.tee_local(target_block);
                         ctx.builder.const_i32(0);
                         ctx.builder.ge_i32();
@@ -1414,8 +1500,7 @@ fn jit_generate_module(
                         jump_offset_is_32,
                     } => {
                         if jump_offset_is_32 {
-                            codegen::gen_set_eip_low_bits_and_jump_rel32(
-                                ctx.builder,
+                            codegen::gen_set_eip_low_bits_and_jump_rel(ctx,
                                 block.end_addr as i32 & 0xFFF,
                                 jump_offset,
                             );
@@ -1443,8 +1528,7 @@ fn jit_generate_module(
 
                         if Page::page_of(next_block_addr) != Page::page_of(block.addr) {
                             if jump_offset_is_32 {
-                                codegen::gen_set_eip_low_bits_and_jump_rel32(
-                                    ctx.builder,
+                                codegen::gen_set_eip_low_bits_and_jump_rel(ctx,
                                     block.end_addr as i32 & 0xFFF,
                                     jump_offset,
                                 );
@@ -1580,8 +1664,7 @@ fn jit_generate_module(
                                         ctx.builder.if_i32();
                                     }
                                     if jump_offset_is_32 {
-                                        codegen::gen_set_eip_low_bits_and_jump_rel32(
-                                            ctx.builder,
+                                        codegen::gen_set_eip_low_bits_and_jump_rel(ctx,
                                             block.end_addr as i32 & 0xFFF,
                                             jump_offset,
                                         );
@@ -1705,8 +1788,7 @@ fn jit_generate_module(
 
                                 if case == Case::BranchTaken {
                                     if jump_offset_is_32 {
-                                        codegen::gen_set_eip_low_bits_and_jump_rel32(
-                                            ctx.builder,
+                                        codegen::gen_set_eip_low_bits_and_jump_rel(ctx,
                                             block.end_addr as i32 & 0xFFF,
                                             jump_offset,
                                         );
@@ -1774,8 +1856,7 @@ fn jit_generate_module(
                                 ctx.builder.if_void();
 
                                 if jump_offset_is_32 {
-                                    codegen::gen_set_eip_low_bits_and_jump_rel32(
-                                        ctx.builder,
+                                    codegen::gen_set_eip_low_bits_and_jump_rel(ctx,
                                         block.end_addr as i32 & 0xFFF,
                                         jump_offset,
                                     );
@@ -2033,6 +2114,9 @@ fn jit_generate_module(
     for local in ctx.register_locals.drain(..) {
         ctx.builder.free_local(local);
     }
+    for local in ctx.register_locals64.drain(..) {
+        ctx.builder.free_local_i64(local);
+    }
     ctx.builder
         .free_local(ctx.instruction_counter.unsafe_clone());
 
@@ -2088,6 +2172,9 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
     ctx.cpu.eip = start_addr;
     ctx.current_instruction = Instruction::Other;
     ctx.previous_instruction = Instruction::Other;
+    ctx.flags64 = crate::jit64::Flags64::Unknown;
+    ctx.dirty_registers64 = 0xFFFF;
+    ctx.block_end = stop_addr;
 
     loop {
         let mut instruction = 0;
@@ -2102,8 +2189,8 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
             // - Set eip to *after* the instruction
             // - Set previous_eip to *before* the instruction
             if needs_eip_updated {
-                codegen::gen_set_previous_eip_offset_from_eip_with_low_bits(
-                    ctx.builder,
+                codegen::gen_set_previous_eip_offset_from_eip_with_low_bits_ctx(
+                    ctx,
                     last_instruction_addr as i32 & 0xFFF,
                 );
                 codegen::gen_set_eip_low_bits(ctx.builder, stop_addr as i32 & 0xFFF);
@@ -2115,7 +2202,12 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
         ctx.start_of_current_instruction = ctx.cpu.eip;
         let start_eip = ctx.cpu.eip;
         let mut instruction_flags = 0;
-        jit_instructions::jit_instruction(ctx, &mut instruction_flags);
+        if ctx.cpu.is_64() {
+            crate::jit64::jit_instruction(ctx, &mut instruction_flags);
+        }
+        else {
+            jit_instructions::jit_instruction(ctx, &mut instruction_flags);
+        }
         let end_eip = ctx.cpu.eip;
 
         let instruction_length = end_eip - start_eip;
@@ -2153,13 +2245,17 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
 }
 
 pub fn jit_increase_hotness_and_maybe_compile(
-    virt_address: i32,
+    virt_address: u64,
     phys_address: u32,
     cs_offset: u32,
     state_flags: CachedStateFlags,
     heat: u32,
 ) {
     if unsafe { JIT_DISABLED } {
+        return;
+    }
+
+    if state_flags.is_64() && unsafe { JIT64_DISABLED } {
         return;
     }
 
@@ -2177,7 +2273,7 @@ pub fn jit_increase_hotness_and_maybe_compile(
     }
 
     *hotness += heat;
-    if *hotness >= JIT_THRESHOLD {
+    if *hotness >= unsafe { JIT_HOTNESS_THRESHOLD } {
         if is_compiling {
             return;
         }
@@ -2218,6 +2314,9 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
 
         for i in 0..unsafe { cpu::valid_tlb_entries_count } {
             let page = unsafe { cpu::valid_tlb_entries[i as usize] };
+            if page >= 0x10_0000 {
+                continue;
+            }
             unsafe {
                 match cpu::tlb_code[page as usize] {
                     None => {},
@@ -2281,22 +2380,26 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
 
             for i in 0..unsafe { cpu::valid_tlb_entries_count } {
                 let page = unsafe { cpu::valid_tlb_entries[i as usize] };
-                let entry = unsafe { cpu::tlb_data[page as usize] };
+                let entry = unsafe { cpu::tlb_pick_entry(page << 12) };
                 if 0 != entry {
                     let tlb_physical_page = Page::of_u32(
-                        (entry as u32 >> 12 ^ page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
+                        ((entry >> 12 ^ page) as u32).wrapping_sub(unsafe { memory::mem8 } as u32 >> 12),
                     );
-                    match unsafe { cpu::tlb_code[page as usize] } {
+                    let slot = match unsafe { cpu::tlb_code_slot(page) } {
+                        Some(slot) => slot,
+                        None => continue,
+                    };
+                    match *slot {
                         None => {},
                         Some(c) => unsafe {
                             let w = c.as_ref().wasm_table_index;
                             if wasm_table_index == w {
                                 drop(Box::from_raw(c.as_ptr()));
-                                cpu::tlb_code[page as usize] = None;
+                                *slot = None;
                                 if !ctx.entry_points.contains_key(&tlb_physical_page)
                                     && !ctx.pages.contains_key(&tlb_physical_page)
                                 {
-                                    cpu::tlb_data[page as usize] &= !cpu::TLB_HAS_CODE;
+                                    cpu::tlb_put_entry(page << 12, entry & !(cpu::TLB_HAS_CODE as u64));
                                 }
                             }
                         },
@@ -2338,6 +2441,8 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
 
     if did_have_code {
         cpu::tlb_set_has_code(page, false);
+        // compiled 64-bit code may be running and must not continue after this instruction
+        unsafe { crate::jit64::JIT64_EXIT = true };
     }
 
     if !did_have_code {
@@ -2511,6 +2616,9 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         1 => MAX_PAGES = value,
         2 => JIT_USE_LOOP_SAFETY = value != 0,
         3 => MAX_EXTRA_BASIC_BLOCKS = value,
+        4 => JIT64_DISABLED = value != 0,
+        5 => JIT_HOTNESS_THRESHOLD = value,
+        6 => crate::jit64::PROFILE_GENERIC = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -2522,6 +2630,8 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         1 => MAX_PAGES as u32,
         2 => JIT_USE_LOOP_SAFETY as u32,
         3 => MAX_EXTRA_BASIC_BLOCKS as u32,
+        4 => JIT64_DISABLED as u32,
+        5 => JIT_HOTNESS_THRESHOLD,
         _ => 0,
     }
 }

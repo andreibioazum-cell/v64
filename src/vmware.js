@@ -236,16 +236,16 @@ VMwareMouse.prototype.push_packet = function(status, x, y, wheel, move_only)
 
 VMwareMouse.prototype.port_read32 = function()
 {
-    const reg32 = this.cpu.reg32;
-    if(reg32[REG_EAX] !== VMWARE_MAGIC)
+    const cpu = this.cpu;
+    if(cpu.get_reg32(REG_EAX) !== VMWARE_MAGIC)
     {
         return 0xFFFFFFFF | 0;
     }
 
-    switch(reg32[REG_ECX] & 0xFFFF)
+    switch(cpu.get_reg32(REG_ECX) & 0xFFFF)
     {
         case CMD_GETVERSION:
-            reg32[REG_EBX] = VMWARE_MAGIC;
+            cpu.set_reg32(REG_EBX, VMWARE_MAGIC);
             return 6;
 
         case CMD_GETSELLENGTH:
@@ -269,7 +269,7 @@ VMwareMouse.prototype.port_read32 = function()
 
         case CMD_SETSELLENGTH:
         {
-            const n = Math.min(reg32[REG_EBX] >>> 0, CLIP_MAX);
+            const n = Math.min(cpu.get_reg32(REG_EBX) >>> 0, CLIP_MAX);
             this.clip_in = new Uint8Array(n);
             this.clip_in_cursor = 0;
             if(n === 0)
@@ -282,7 +282,7 @@ VMwareMouse.prototype.port_read32 = function()
         case CMD_SETNEXTPIECE:
         {
             const c = this.clip_in;
-            const v = reg32[REG_EBX] >>> 0;
+            const v = cpu.get_reg32(REG_EBX) >>> 0;
             let i = this.clip_in_cursor;
             if(i < c.length) c[i++] = v;
             if(i < c.length) c[i++] = v >>> 8;
@@ -308,9 +308,9 @@ VMwareMouse.prototype.port_read32 = function()
             // command a 32-bit guest agent can consume — read unsigned it's
             // good until 2106.
             const now = Date.now();
-            reg32[REG_EBX] = now % 1000 * 1000;
-            reg32[REG_ECX] = 1000000;
-            reg32[REG_EDX] = -new Date(now).getTimezoneOffset();
+            cpu.set_reg32(REG_EBX, now % 1000 * 1000);
+            cpu.set_reg32(REG_ECX, 1000000);
+            cpu.set_reg32(REG_EDX, -new Date(now).getTimezoneOffset());
             return now / 1000 >>> 0;
         }
 
@@ -319,20 +319,20 @@ VMwareMouse.prototype.port_read32 = function()
 
         case CMD_ABSPOINTER_DATA:
         {
-            const n = Math.min(reg32[REG_EBX] >>> 0, 4, this.queue.length);
+            const n = Math.min(cpu.get_reg32(REG_EBX) >>> 0, 4, this.queue.length);
             const v = [0, 0, 0, 0];
             for(let i = 0; i < n; i++)
             {
                 v[i] = this.queue.shift();
             }
-            reg32[REG_EBX] = v[1];
-            reg32[REG_ECX] = v[2];
-            reg32[REG_EDX] = v[3];
+            cpu.set_reg32(REG_EBX, v[1]);
+            cpu.set_reg32(REG_ECX, v[2]);
+            cpu.set_reg32(REG_EDX, v[3]);
             return v[0];
         }
 
         case CMD_ABSPOINTER_COMMAND:
-            switch(reg32[REG_EBX])
+            switch(cpu.get_reg32(REG_EBX))
             {
                 case ABSPOINTER_ENABLE:
                     this.enabled = true;

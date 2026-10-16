@@ -1,6 +1,8 @@
 import { dbg_log, LOG_LEVEL } from "./log.js";
 
-// A minimal elf parser for loading 32 bit, x86, little endian, executable elf files
+// A minimal elf parser for loading 32 or 64 bit, x86, little endian, executable elf files.
+// In 64 bit files, virtual addresses (entry, vaddr, section addr) and section flags are
+// returned as BigInt; file offsets, sizes and physical addresses are narrowed to numbers.
 
 const ELF_MAGIC = 0x464C457F;
 
@@ -8,6 +10,17 @@ const types = DataView.prototype;
 const U8 = { size: 1, get: types.getUint8, set: types.setUint8, };
 const U16 = { size: 2, get: types.getUint16, set: types.setUint16, };
 const U32 = { size: 4, get: types.getUint32, set: types.setUint32, };
+const U64 = { size: 8, get: types.getBigUint64, set: types.setBigUint64, };
+const U64N = {
+    size: 8,
+    /** @this {DataView} */
+    get: function(offset, little_endian)
+    {
+        const value = this.getBigUint64(offset, little_endian);
+        console.assert(value <= BigInt(Number.MAX_SAFE_INTEGER), "elf field out of range");
+        return Number(value);
+    },
+};
 const pad = function(size)
 {
     return {
@@ -71,6 +84,62 @@ const SectionHeader = create_struct([
 ]);
 console.assert(SectionHeader.reduce((a, entry) => a + entry.size, 0) === 40);
 
+const Header64 = create_struct([
+    { magic: U32, },
+
+    { class: U8, },
+    { data: U8, },
+    { version0: U8, },
+    { osabi: U8, },
+
+    { abiversion: U8, },
+    { pad0: pad(7) },
+
+    { type: U16, },
+    { machine: U16, },
+
+    { version1: U32, },
+    { entry: U64, },
+    { phoff: U64N, },
+    { shoff: U64N, },
+    { flags: U32, },
+
+    { ehsize: U16, },
+    { phentsize: U16, },
+    { phnum: U16, },
+    { shentsize: U16, },
+    { shnum: U16, },
+    { shstrndx: U16, },
+]);
+console.assert(Header64.reduce((a, entry) => a + entry.size, 0) === 64);
+
+// note: flags comes second in the 64 bit layout
+const ProgramHeader64 = create_struct([
+    { type: U32, },
+    { flags: U32, },
+    { offset: U64N, },
+    { vaddr: U64, },
+    { paddr: U64N, },
+    { filesz: U64N, },
+    { memsz: U64N, },
+    { align: U64N, },
+]);
+console.assert(ProgramHeader64.reduce((a, entry) => a + entry.size, 0) === 56);
+
+const SectionHeader64 = create_struct([
+    { name: U32, },
+    { type: U32, },
+    { flags: U64, },
+    { addr: U64, },
+    { offset: U64N, },
+    { size: U64N, },
+    { link: U32, },
+    { info: U32, },
+    { addralign: U64N, },
+    { entsize: U64N, },
+]);
+console.assert(SectionHeader64.reduce((a, entry) => a + entry.size, 0) === 64);
+
 
 // From [{ name: type }, ...] to [{ name, type, size, get, set }, ...]
 function create_struct(struct)
@@ -99,8 +168,9 @@ export function read_elf(buffer)
 {
     const view = new DataView(buffer);
 
-    const [header, offset] = read_struct(view, Header);
-    console.assert(offset === 52);
+    const is_64 = view.getUint8(4) === 2;
+    const [header, offset] = read_struct(view, is_64 ? Header64 : Header);
+    console.assert(offset === (is_64 ? 64 : 52));
 
     if(DEBUG)
     {
@@ -111,7 +181,7 @@ export function read_elf(buffer)
     }
 
     console.assert(header.magic === ELF_MAGIC, "Bad magic");
-    console.assert(header.class === 1, "Unimplemented: 64 bit elf");
+    console.assert(header.class === 1 || header.class === 2, "Bad class");
     console.assert(header.data === 1, "Unimplemented: big endian");
     console.assert(header.version0 === 1, "Bad version0");
 
@@ -121,19 +191,18 @@ export function read_elf(buffer)
 
     console.assert(header.version1 === 1, "Bad version1");
 
-    // these are different in 64 bit
-    console.assert(header.ehsize === 52, "Bad header size");
-    console.assert(header.phentsize === 32, "Bad program header size");
-    console.assert(header.shentsize === 40, "Bad section header size");
+    console.assert(header.ehsize === (is_64 ? 64 : 52), "Bad header size");
+    console.assert(header.phentsize === (is_64 ? 56 : 32), "Bad program header size");
+    console.assert(header.shnum === 0 || header.shentsize === (is_64 ? 64 : 40), "Bad section header size");
 
     const [program_headers, ph_offset] = read_structs(
         view_slice(view, header.phoff, header.phentsize * header.phnum),
-        ProgramHeader,
+        is_64 ? ProgramHeader64 : ProgramHeader,
         header.phnum);
 
     const [sections_headers, sh_offset] = read_structs(
         view_slice(view, header.shoff, header.shentsize * header.shnum),
-        SectionHeader,
+        is_64 ? SectionHeader64 : SectionHeader,
         header.shnum);
 
     if(DEBUG && LOG_LEVEL)
@@ -176,6 +245,7 @@ export function read_elf(buffer)
     }
 
     return {
+        is_64,
         header,
         program_headers,
         sections_headers,

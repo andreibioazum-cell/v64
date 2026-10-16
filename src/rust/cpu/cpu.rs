@@ -6,9 +6,9 @@ use crate::cpu::global_pointers::*;
 use crate::cpu::memory;
 use crate::cpu::misc_instr::{
     adjust_stack_reg, get_stack_pointer, getaf, getcf, getof, getpf, getsf, getzf, pop16, pop32s,
-    push16, push32,
+    pop64, push16, push32, push64,
 };
-use crate::cpu::modrm::{resolve_modrm16, resolve_modrm32};
+use crate::cpu::modrm::{resolve_modrm16, resolve_modrm32, resolve_modrm64};
 use crate::cpu::{apic, ioapic, pic};
 use crate::dbg::dbg_trace;
 use crate::gen;
@@ -121,6 +121,7 @@ pub const FLAGS_ALL: i32 =
 pub const OPSIZE_8: i32 = 7;
 pub const OPSIZE_16: i32 = 15;
 pub const OPSIZE_32: i32 = 31;
+pub const OPSIZE_64: i32 = 63;
 
 pub const EAX: i32 = 0;
 pub const ECX: i32 = 1;
@@ -165,6 +166,14 @@ pub const PAGE_TABLE_ACCESSED_MASK: i32 = 1 << 5;
 pub const PAGE_TABLE_DIRTY_MASK: i32 = 1 << 6;
 pub const PAGE_TABLE_PSE_MASK: i32 = 1 << 7;
 pub const PAGE_TABLE_GLOBAL_MASK: i32 = 1 << 8;
+// Reserved bits in 64-bit paging-structure entries (PAE/long mode): physical
+// address bits 32..51 — v86 only maps guest memory below 4 GiB. Bits 52..62
+// are ignored (available to software on real hardware), bit 63 is NX (handled
+// separately against EFER.NXE)
+pub const PAE_ENTRY_RSVD: u64 = 0x000F_FFFF_0000_0000;
+// Reserved bits 20:13 in 2 MiB PDEs (PAE/long mode); 4 MiB PDEs in legacy
+// 32-bit mode use some of these as address bits (PSE-36)
+pub const PAE_PDE_PS_RSVD: u64 = 0x1F_E000;
 pub const MMAP_BLOCK_BITS: i32 = 17;
 pub const MMAP_BLOCK_SIZE: i32 = 1 << MMAP_BLOCK_BITS;
 pub const CR0_PE: i32 = 1;
@@ -236,9 +245,22 @@ pub const IA32_MISC_ENABLE: i32 = 0x1A0;
 pub const IA32_PAT: i32 = 0x277;
 pub const IA32_RTIT_CTL: i32 = 0x570;
 pub const MSR_PKG_C2_RESIDENCY: i32 = 0x60D;
-pub const IA32_KERNEL_GS_BASE: i32 = 0xC0000101u32 as i32;
+pub const IA32_FS_BASE: i32 = 0xC0000100u32 as i32;
+pub const IA32_GS_BASE: i32 = 0xC0000101u32 as i32;
+pub const IA32_KERNEL_GS_BASE: i32 = 0xC0000102u32 as i32;
 pub const MSR_AMD64_LS_CFG: i32 = 0xC0011020u32 as i32;
 pub const MSR_AMD64_DE_CFG: i32 = 0xC0011029u32 as i32;
+
+pub const IA32_EFER: i32 = 0xC0000080u32 as i32;
+pub const IA32_STAR: i32 = 0xC0000081u32 as i32;
+pub const IA32_LSTAR: i32 = 0xC0000082u32 as i32;
+pub const IA32_CSTAR: i32 = 0xC0000083u32 as i32;
+pub const IA32_SFMASK: i32 = 0xC0000084u32 as i32;
+
+pub const EFER_SCE: u64 = 1 << 0;
+pub const EFER_LME: u64 = 1 << 8;
+pub const EFER_LMA: u64 = 1 << 10;
+pub const EFER_NXE: u64 = 1 << 11;
 
 pub const IA32_APIC_BASE_BSP: i32 = 1 << 8;
 pub const IA32_APIC_BASE_EXTD: i32 = 1 << 10;
@@ -261,6 +283,7 @@ pub const TLB_NO_USER: i32 = 1 << 2;
 pub const TLB_IN_MAPPED_RANGE: i32 = 1 << 3;
 pub const TLB_GLOBAL: i32 = 1 << 4;
 pub const TLB_HAS_CODE: i32 = 1 << 5;
+pub const TLB_NOT_EXECUTABLE: i32 = 1 << 6;
 pub const IVT_SIZE: u32 = 0x400;
 pub const CPU_EXCEPTION_DE: i32 = 0;
 pub const CPU_EXCEPTION_DB: i32 = 1;
@@ -325,7 +348,126 @@ pub struct Code {
 pub static mut tlb_data: [i32; 0x100000] = [0; 0x100000];
 pub static mut tlb_code: [Option<ptr::NonNull<Code>>; 0x100000] = [None; 0x100000];
 
-pub static mut valid_tlb_entries: [i32; 10000] = [0; 10000];
+// TLB for linear pages at or above 4 GiB (48-bit virtual addresses in long
+// mode). Direct-mapped, keyed by the full page number; an entry is valid if
+// tlb_high_page[idx] == page and tlb_high_entry[idx] != 0. The entry format is
+// the same as in tlb_data, but as u64 (the page number << 12 may exceed 32
+// bits): (high + mem8) ^ (page << 12) | info_bits, so the physical address is
+// reconstructed as (entry & !0xFFF ^ address) as u32 - mem8.
+pub const TLB_HIGH_SIZE: usize = 0x40000;
+pub static mut tlb_high_page: [u64; TLB_HIGH_SIZE] = [0; TLB_HIGH_SIZE];
+pub static mut tlb_high_entry: [u64; TLB_HIGH_SIZE] = [0; TLB_HIGH_SIZE];
+// jitted code for the page in tlb_high_page[idx] (the counterpart of tlb_code
+// for pages at or above 4 GiB); dropped whenever the slot is evicted
+pub static mut tlb_code_high: [Option<ptr::NonNull<Code>>; TLB_HIGH_SIZE] = [None; TLB_HIGH_SIZE];
+
+/// Remove the high TLB entry at idx, including its jitted code
+#[inline]
+pub unsafe fn tlb_high_evict(idx: usize) {
+    tlb_high_page[idx] = 0;
+    tlb_high_entry[idx] = 0;
+    if let Some(c) = tlb_code_high[idx].take() {
+        drop(Box::from_raw(c.as_ptr()));
+    }
+}
+
+/// The jitted-code slot for a virtual page: pages below 4 GiB always have one,
+/// higher pages only while they are in the TLB
+#[inline]
+pub unsafe fn tlb_code_slot(page: u64) -> Option<&'static mut Option<ptr::NonNull<Code>>> {
+    if page < 0x10_0000 {
+        Some(&mut *ptr::addr_of_mut!(tlb_code[page as usize]))
+    }
+    else {
+        let idx = tlb_high_index(page);
+        if tlb_high_page[idx] == page {
+            Some(&mut *ptr::addr_of_mut!(tlb_code_high[idx]))
+        }
+        else {
+            None
+        }
+    }
+}
+
+/// The jitted code for a virtual page, if any
+#[inline]
+pub unsafe fn tlb_code_get(page: u64) -> Option<ptr::NonNull<Code>> {
+    match tlb_code_slot(page) {
+        Some(slot) => *slot,
+        None => None,
+    }
+}
+
+/// Strip the canonical sign-extension bits (63:48), which don't take part in
+/// translation, so that TLB page numbers and page-walk indices fit.
+#[inline]
+pub fn canonicalize_address(address: u64) -> u64 {
+    address & 0x0000_FFFF_FFFF_FFFF
+}
+
+#[inline]
+pub fn tlb_high_index(page: u64) -> usize {
+    (page.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 25) as usize & (TLB_HIGH_SIZE - 1)
+}
+
+/// The TLB entry (with info bits) for the page containing address, or 0 if none.
+#[inline]
+pub unsafe fn tlb_pick_entry(address: u64) -> u64 {
+    let address = canonicalize_address(address);
+    let page = address >> 12;
+    if page < 0x10_0000 {
+        tlb_data[page as usize] as u32 as u64
+    }
+    else {
+        let idx = tlb_high_index(page);
+        if tlb_high_page[idx] == page {
+            tlb_high_entry[idx]
+        }
+        else {
+            0
+        }
+    }
+}
+
+/// Insert a TLB entry (as produced by do_page_walk) for the page containing address.
+#[inline]
+pub unsafe fn tlb_put_entry(address: u64, tlb_entry: u64) {
+    let address = canonicalize_address(address);
+    let page = address >> 12;
+    if page < 0x10_0000 {
+        tlb_data[page as usize] = tlb_entry as u32 as i32;
+    }
+    else {
+        let idx = tlb_high_index(page);
+        if tlb_high_page[idx] != page {
+            tlb_high_evict(idx);
+        }
+        tlb_high_page[idx] = page;
+        tlb_high_entry[idx] = tlb_entry;
+    }
+}
+
+/// Invalidate the TLB entry for the page containing address (if any).
+#[inline]
+pub unsafe fn tlb_invalidate_page(address: u64) {
+    let address = canonicalize_address(address);
+    let page = address >> 12;
+    if page < 0x10_0000 {
+        clear_tlb_code(page);
+        tlb_data[page as usize] = 0;
+    }
+    else {
+        let idx = tlb_high_index(page);
+        if tlb_high_page[idx] == page {
+            tlb_high_evict(idx);
+        }
+    }
+}
+
+// TLB membership list: page numbers can be up to 36 bits (48-bit linear
+// address space), so entries must be stored at full width or high pages would
+// silently survive flush/invalidate
+pub static mut valid_tlb_entries: [u64; 10000] = [0; 10000];
 pub static mut valid_tlb_entries_count: i32 = 0;
 
 pub static mut in_jit: bool = false;
@@ -394,6 +536,32 @@ pub enum SelectorNullOrInvalid {
     OutsideOfTableLimit,
 }
 
+/// 64-bit interrupt/trap gate descriptor (16 bytes in long mode).
+pub struct InterruptDescriptor64 {
+    pub low: u64,
+    pub high: u64,
+}
+
+impl InterruptDescriptor64 {
+    pub fn of_u128(low: u64, high: u64) -> InterruptDescriptor64 {
+        InterruptDescriptor64 { low, high }
+    }
+    pub fn offset(&self) -> u64 {
+        self.low & 0xFFFF | self.low >> 32 & 0xFFFF_0000 | self.high << 32
+    }
+    pub fn selector(&self) -> u16 { (self.low >> 16 & 0xFFFF) as u16 }
+    pub fn ist(&self) -> u8 { (self.low >> 32 & 7) as u8 }
+    pub fn access_byte(&self) -> u8 { (self.low >> 40 & 0xFF) as u8 }
+    pub fn dpl(&self) -> u8 { (self.access_byte() >> 5 & 3) as u8 }
+    pub fn gate_type(&self) -> u8 { self.access_byte() & 0xF }
+    pub fn is_present(&self) -> bool { self.access_byte() & 0x80 == 0x80 }
+    /// interrupt (0xE) or trap (0xF) gate; these are the only valid types in long mode
+    pub fn is_valid_long_mode_gate(&self) -> bool {
+        self.gate_type() & !1 == 0xE
+    }
+    pub fn is_trap_gate(&self) -> bool { self.gate_type() & 1 == 1 }
+}
+
 pub struct SegmentDescriptor {
     pub raw: u64,
 }
@@ -421,6 +589,8 @@ impl SegmentDescriptor {
     pub fn is_conforming_executable(&self) -> bool { self.is_dc() && self.is_executable() }
     pub fn dpl(&self) -> u8 { (self.access_byte() >> 5) & 3 }
     pub fn is_32(&self) -> bool { self.flags() & 4 == 4 }
+    // the L bit (64-bit code segment); only meaningful when EFER.LMA=1
+    pub fn is_64(&self) -> bool { self.flags() & 2 == 2 }
     pub fn effective_limit(&self) -> u32 {
         if self.flags() & 8 == 8 {
             self.limit() << 12 | 0xFFF
@@ -472,7 +642,7 @@ pub unsafe fn switch_cs_real_mode(selector: i32) {
     *sreg.offset(CS as isize) = selector as u16;
     *segment_is_null.offset(CS as isize) = false;
     *segment_offsets.offset(CS as isize) = selector << 4;
-    update_cs_size(false);
+    update_cs_size(false, false);
 }
 
 unsafe fn get_tss_ss_esp(dpl: u8) -> OrPageFault<(i32, i32)> {
@@ -482,7 +652,7 @@ unsafe fn get_tss_ss_esp(dpl: u8) -> OrPageFault<(i32, i32)> {
             panic!("#TS handler");
         }
         let addr = translate_address_system_read(
-            *segment_offsets.offset(TR as isize) + tss_stack_offset as i32,
+            (*segment_offsets.offset(TR as isize) + tss_stack_offset as i32) as u32 as u64,
         )?;
         dbg_assert!(addr & 0xFFF <= 0x1000 - 6);
         (memory::read16(addr + 4), memory::read32s(addr))
@@ -493,17 +663,185 @@ unsafe fn get_tss_ss_esp(dpl: u8) -> OrPageFault<(i32, i32)> {
             panic!("#TS handler");
         }
         let addr = translate_address_system_read(
-            *segment_offsets.offset(TR as isize) + tss_stack_offset as i32,
+            (*segment_offsets.offset(TR as isize) + tss_stack_offset as i32) as u32 as u64,
         )?;
         dbg_assert!(addr & 0xFFF <= 0x1000 - 4);
         (memory::read16(addr + 2), memory::read16(addr))
     })
 }
 
+/// The RSP[dpl] stack pointer from the 64-bit TSS (used for privilege-level
+/// switches when delivering interrupts in long mode).
+unsafe fn get_tss_rsp64(dpl: u8) -> OrPageFault<u64> {
+    // 64-bit TSS: rsp0/1/2 at offsets 4, 12, 20
+    let tss_stack_offset = 4u32 + ((dpl as u32) << 3);
+    if tss_stack_offset + 7 > *segment_limits.offset(TR as isize) {
+        trigger_ts(0);
+        return Err(());
+    }
+    let tss_base = *tss_base64;
+    let addr =
+        translate_address_system_read(tss_base + tss_stack_offset as u64)?;
+    Ok(memory::read64s(addr) as u64)
+}
+
+/// The ISTn stack pointer from the 64-bit TSS (ist is 1-7).
+unsafe fn get_tss_ist64(ist: u8) -> OrPageFault<u64> {
+    dbg_assert!(ist >= 1 && ist <= 7);
+    // 64-bit TSS: reserved@0x00, RSP0..2 at 0x04, IST1..7 at 0x1C
+    let offset = 0x1cu32 + ((ist as u32 - 1) << 3);
+    if offset + 7 > *segment_limits.offset(TR as isize) {
+        trigger_ts(0);
+        return Err(());
+    }
+    let tss_base = *tss_base64;
+    let addr =
+        translate_address_system_read(tss_base + offset as u64)?;
+    Ok(memory::read64s(addr) as u64)
+}
+
 pub unsafe fn iret16() { iret(true); }
 pub unsafe fn iret32() { iret(false); }
 
+/// 64-bit interrupt return (iretq).
+pub unsafe fn iret64() {
+    dbg_assert!(*is_64);
+    *nmi_blocked = false;
+
+    let rsp = read_reg64(ESP);
+    let new_rip = return_on_pagefault!(safe_read64s(rsp));
+    let new_cs = return_on_pagefault!(safe_read64s(rsp + 8)) as u16;
+    let new_flags = return_on_pagefault!(safe_read64s(rsp + 16)) as u32 as i32;
+
+    let cs_selector = SegmentSelector::of_u16(new_cs);
+    if cs_selector.is_null() {
+        dbg_log!("#gp iret64: null cs selector");
+        trigger_gp(0);
+        return;
+    }
+
+    let cs_descriptor = match return_on_pagefault!(lookup_segment_selector(cs_selector)) {
+        Ok((desc, _)) => desc,
+        Err(SelectorNullOrInvalid::IsNull) => {
+            trigger_gp(new_cs as i32 & !3);
+            return;
+        },
+        Err(SelectorNullOrInvalid::OutsideOfTableLimit) => {
+            dbg_log!("#gp iret64: cs selector outside of table limit");
+            trigger_gp(new_cs as i32 & !3);
+            return;
+        },
+    };
+
+    if !cs_descriptor.is_executable() || !cs_descriptor.is_present() {
+        dbg_log!("#gp iret64: cs not executable or not present");
+        trigger_gp(new_cs as i32 & !3);
+        return;
+    }
+
+    let new_cpl = cs_selector.rpl();
+    if new_cpl < *cpl {
+        dbg_log!("#gp iret64: rpl < cpl");
+        trigger_gp(new_cs as i32 & !3);
+        return;
+    }
+    if !cs_descriptor.is_dc() && cs_selector.rpl() != cs_descriptor.dpl() {
+        dbg_log!("#gp iret64: non-conforming cs and rpl != dpl");
+        trigger_gp(new_cs as i32 & !3);
+        return;
+    }
+    if cs_descriptor.is_dc() && cs_descriptor.dpl() > cs_selector.rpl() {
+        dbg_log!("#gp iret64: conforming cs and dpl > rpl");
+        trigger_gp(new_cs as i32 & !3);
+        return;
+    }
+
+    if new_cpl > *cpl {
+        // outer privilege return: pop rsp and ss as well
+        let new_rsp = return_on_pagefault!(safe_read64s(rsp + 24));
+        let new_ss = return_on_pagefault!(safe_read64s(rsp + 32)) as u16;
+
+        let ss_selector = SegmentSelector::of_u16(new_ss);
+        if ss_selector.is_null() {
+            // loading a null selector into ss is not allowed on iret
+            dbg_log!("#gp iret64: null ss selector");
+            trigger_gp(0);
+            return;
+        }
+        let ss_descriptor = match return_on_pagefault!(lookup_segment_selector(ss_selector)) {
+            Ok((desc, _)) => desc,
+            Err(SelectorNullOrInvalid::IsNull) | Err(SelectorNullOrInvalid::OutsideOfTableLimit) => {
+                dbg_log!("#gp iret64: invalid ss selector");
+                trigger_gp(new_ss as i32 & !3);
+                return;
+            },
+        };
+
+        if ss_descriptor.is_system()
+            || ss_selector.rpl() != new_cpl
+            || !ss_descriptor.is_writable()
+            || ss_descriptor.dpl() != new_cpl
+        {
+            dbg_log!("#gp iret64: invalid ss descriptor");
+            trigger_gp(new_ss as i32 & !3);
+            return;
+        }
+        if !ss_descriptor.is_present() {
+            dbg_log!("#ss iret64: ss not present");
+            trigger_ss(new_ss as i32 & !3);
+            return;
+        }
+
+        // no exceptions below
+
+        // rflags are updated with the permissions of the old cpl (at cpl 3,
+        // update_eflags would keep if and iopl, like popf), as in iret32
+        update_eflags(new_flags);
+
+        // switch_seg(SS) checks the descriptor against cpl; the checks in
+        // switch_seg must see the *target* cpl (same order as iret32)
+        *cpl = new_cpl;
+        cpl_changed();
+
+        write_reg64(ESP, new_rsp);
+
+        if !switch_seg(SS, new_ss as i32) {
+            dbg_assert!(false);
+        }
+    }
+    else {
+        // same privilege: the 64-bit frame is always 5 slots; the frame's RSP
+        // is loaded even when returning to the same CPL (handlers may rewrite
+        // it, e.g. the int3 selftest patching the pt_regs sp/rip), but SS is
+        // left alone
+        let new_rsp = return_on_pagefault!(safe_read64s(rsp + 24));
+        write_reg64(ESP, new_rsp);
+
+        update_eflags(new_flags);
+    }
+
+    // no exceptions below
+
+    *cpl = new_cpl;
+    cpl_changed();
+
+    *sreg.offset(CS as isize) = new_cs;
+    *segment_is_null.offset(CS as isize) = false;
+    *segment_limits.offset(CS as isize) = cs_descriptor.effective_limit();
+    *segment_offsets.offset(CS as isize) = if *is_64 { 0 } else { cs_descriptor.base() };
+    *segment_access_bytes.offset(CS as isize) = cs_descriptor.access_byte();
+
+    update_cs_size(cs_descriptor.is_32(), cs_descriptor.is_64());
+
+    *instruction_pointer = new_rip;
+
+    update_state_flags();
+
+    handle_irqs();
+}
+
 pub unsafe fn iret(is_16: bool) {
+    *nmi_blocked = false;
     if vm86_mode() && getiopl() < 3 {
         // vm86 mode, iopl != 3
         dbg_log!("#gp iret vm86 mode, iopl != 3");
@@ -532,7 +870,7 @@ pub unsafe fn iret(is_16: bool) {
         }
 
         switch_cs_real_mode(new_cs);
-        *instruction_pointer = get_seg_cs() + new_eip;
+        *instruction_pointer = (get_seg_cs() as u32).wrapping_add(new_eip as u32) as u64;
 
         if is_16 {
             update_eflags(new_flags | *flags & !0xFFFF);
@@ -558,7 +896,8 @@ pub unsafe fn iret(is_16: bool) {
     if *flags & FLAG_NT != 0 {
         // nested task: return to the task linked through the back-link field of the current tss
         let tss_offset = *segment_offsets.offset(TR as isize);
-        let backlink = return_on_pagefault!(safe_read16(tss_offset + TSR_BACKLINK));
+        let backlink =
+            return_on_pagefault!(safe_read16((tss_offset + TSR_BACKLINK) as u32 as u64));
         do_task_switch(backlink, None, TaskSwitchSource::Iret);
         return;
     }
@@ -584,7 +923,7 @@ pub unsafe fn iret(is_16: bool) {
             *flags |= FLAG_VM;
 
             switch_cs_real_mode(new_cs);
-            *instruction_pointer = get_seg_cs() + (new_eip & 0xFFFF);
+            *instruction_pointer = (get_seg_cs() as u32).wrapping_add(new_eip as u32 & 0xFFFF) as u64;
 
             if !switch_seg(ES, new_es)
                 || !switch_seg(DS, new_ds)
@@ -606,7 +945,7 @@ pub unsafe fn iret(is_16: bool) {
             *cpl = 3;
             cpl_changed();
 
-            update_cs_size(false);
+            update_cs_size(false, false);
             update_state_flags();
 
             // iret end
@@ -777,13 +1116,13 @@ pub unsafe fn iret(is_16: bool) {
     *sreg.offset(CS as isize) = new_cs as u16;
     dbg_assert!((new_cs & 3) == *cpl as i32);
 
-    update_cs_size(cs_descriptor.is_32());
+    update_cs_size(cs_descriptor.is_32(), cs_descriptor.is_64());
 
     *segment_limits.offset(CS as isize) = cs_descriptor.effective_limit();
     *segment_offsets.offset(CS as isize) = cs_descriptor.base();
     *segment_access_bytes.offset(CS as isize) = cs_descriptor.access_byte();
 
-    *instruction_pointer = new_eip + get_seg_cs();
+    *instruction_pointer = (get_seg_cs() as u32).wrapping_add(new_eip as u32) as u64;
 
     update_state_flags();
 
@@ -797,7 +1136,18 @@ pub unsafe fn call_interrupt_vector(
     is_software_int: bool,
     error_code: Option<i32>,
 ) {
+    // compiled 64-bit code that called into the interpreter must not continue
+    crate::jit64::JIT64_EXIT = true;
     if *protected_mode {
+        if *is_64 {
+            // long mode: 16-byte gates and a 64-bit interrupt frame
+            let was_delivering = in_interrupt_delivery;
+            in_interrupt_delivery = interrupt_nr;
+            call_interrupt_vector64(interrupt_nr, is_software_int, error_code);
+            in_interrupt_delivery = was_delivering;
+            return;
+        }
+
         if vm86_mode() && *cr.offset(4) & CR4_VME != 0 {
             panic!("Unimplemented: VME");
         }
@@ -816,7 +1166,7 @@ pub unsafe fn call_interrupt_vector(
         }
 
         let descriptor_address = return_on_pagefault!(translate_address_system_read(
-            *idtr_offset + (interrupt_nr << 3)
+            (*idtr_offset64).wrapping_add((interrupt_nr << 3) as u64)
         ));
 
         let descriptor = InterruptDescriptor::of_u64(memory::read64s(descriptor_address) as u64);
@@ -965,16 +1315,16 @@ pub unsafe fn call_interrupt_vector(
                     new_esp - stack_space & 0xFFFF
                 };
 
-            return_on_pagefault!(translate_address_system_write(new_stack_pointer));
+            return_on_pagefault!(translate_address_system_write(new_stack_pointer as u32 as u64));
             return_on_pagefault!(translate_address_system_write(
-                ss_segment_descriptor.base() + new_esp - 1
+                (ss_segment_descriptor.base() + new_esp - 1) as u32 as u64
             ));
 
             // no exceptions below
             *cpl = cs_segment_descriptor.dpl();
             cpl_changed();
 
-            update_cs_size(cs_segment_descriptor.is_32());
+            update_cs_size(cs_segment_descriptor.is_32(), cs_segment_descriptor.is_64());
 
             *flags &= !FLAG_VM & !FLAG_RF;
 
@@ -1072,13 +1422,13 @@ pub unsafe fn call_interrupt_vector(
         *sreg.offset(CS as isize) = (selector as u16) & !3 | *cpl as u16;
         dbg_assert!((*sreg.offset(CS as isize) & 3) == *cpl as u16);
 
-        update_cs_size(cs_segment_descriptor.is_32());
+        update_cs_size(cs_segment_descriptor.is_32(), cs_segment_descriptor.is_64());
 
         *segment_limits.offset(CS as isize) = cs_segment_descriptor.effective_limit();
         *segment_offsets.offset(CS as isize) = cs_segment_descriptor.base();
         *segment_access_bytes.offset(CS as isize) = cs_segment_descriptor.access_byte();
 
-        *instruction_pointer = get_seg_cs() + offset;
+        *instruction_pointer = (get_seg_cs() as u32).wrapping_add(offset as u32) as u64;
 
         *flags &= !FLAG_NT & !FLAG_VM & !FLAG_RF & !FLAG_TRAP;
 
@@ -1116,9 +1466,208 @@ pub unsafe fn call_interrupt_vector(
         *flags &= !FLAG_INTERRUPT & !FLAG_AC & !FLAG_TRAP;
 
         switch_cs_real_mode(new_cs);
-        *instruction_pointer = get_seg_cs() + new_ip;
+        *instruction_pointer = (get_seg_cs() as u32).wrapping_add(new_ip as u32) as u64;
         update_state_flags();
     }
+}
+
+/// Interrupt/trap delivery in long mode (64-bit submode): 16-byte IDT gates,
+/// a 64-bit interrupt frame and IST stack switches.
+pub unsafe fn call_interrupt_vector64(
+    interrupt_nr: i32,
+    is_software_int: bool,
+    error_code: Option<i32>,
+) {
+    dbg_assert!(*protected_mode && *is_64);
+
+    if (interrupt_nr << 4 | 15) as u32 > *idtr_size as u32 {
+        dbg_log!("interrupt_nr={:x} idtr_size={:x}", interrupt_nr, *idtr_size);
+        if is_software_int {
+            trigger_gp(interrupt_nr << 4 | 2);
+        }
+        else {
+            // an exception while delivering a hardware exception means a
+            // triple fault in practice; shut down with a message instead of
+            // recursing
+            panic!(
+                "Triple fault: exception {} during exception delivery",
+                interrupt_nr
+            );
+        }
+        return;
+    }
+
+    let descriptor_address = return_on_pagefault!(translate_address_system_read(
+        (*idtr_offset64).wrapping_add((interrupt_nr << 4) as u64)
+    ));
+
+    let descriptor = InterruptDescriptor64::of_u128(
+        memory::read64s(descriptor_address) as u64,
+        memory::read64s(descriptor_address + 8) as u64,
+    );
+
+    let offset = descriptor.offset();
+    if is_software_int && descriptor.dpl() < *cpl {
+        dbg_log!("#gp software interrupt ({:x}) and dpl < cpl", interrupt_nr);
+        trigger_gp(interrupt_nr << 4 | 2);
+        return;
+    }
+
+    if !descriptor.is_valid_long_mode_gate() {
+        dbg_log!(
+            "gate type invalid. gate_type=0b{:b} access={:b}",
+            descriptor.gate_type(),
+            descriptor.access_byte()
+        );
+        if is_software_int {
+            trigger_gp(interrupt_nr << 4 | 2);
+        }
+        else {
+            panic!("Triple fault: invalid gate for exception {}", interrupt_nr);
+        }
+        return;
+    }
+
+    if !descriptor.is_present() {
+        dbg_log!("#np int descriptor not present, int={}", interrupt_nr);
+        trigger_np(interrupt_nr << 4 | 2);
+        return;
+    }
+
+    let cs_selector = SegmentSelector::of_u16(descriptor.selector());
+    let cs_descriptor = match return_on_pagefault!(lookup_segment_selector(cs_selector)) {
+        Ok((desc, _)) => desc,
+        Err(SelectorNullOrInvalid::IsNull) | Err(SelectorNullOrInvalid::OutsideOfTableLimit) => {
+            dbg_log!("#gp invalid cs selector in gate, sel={:x}", descriptor.selector());
+            trigger_gp(descriptor.selector() as i32 & !3);
+            return;
+        },
+    };
+
+    if !cs_descriptor.is_executable() {
+        dbg_log!("#gp interrupt: cs not executable");
+        trigger_gp(descriptor.selector() as i32 & !3);
+        return;
+    }
+    if !cs_descriptor.is_present() {
+        dbg_log!("#np interrupt: cs not present");
+        trigger_np(descriptor.selector() as i32 & !3);
+        return;
+    }
+    if !cs_descriptor.is_64() {
+        dbg_log!("#gp interrupt: cs is not a 64-bit code segment");
+        trigger_gp(descriptor.selector() as i32 & !3);
+        return;
+    }
+    if !cs_descriptor.is_dc() && cs_descriptor.dpl() < *cpl {
+        // inter-privilege-level interrupt; dpl is the new cpl
+    }
+    else if cs_descriptor.is_dc() || cs_descriptor.dpl() == *cpl {
+        // intra-privilege-level
+    }
+    else {
+        dbg_log!("#gp interrupt: cs dpl={} cpl={}", cs_descriptor.dpl(), *cpl);
+        trigger_gp(descriptor.selector() as i32 & !3);
+        return;
+    }
+
+    let old_flags = get_eflags();
+    let old_rip = *instruction_pointer;
+    let old_cs = *sreg.offset(CS as isize) as u64;
+    let old_ss = *sreg.offset(SS as isize) as u64;
+    let old_rsp = read_reg64(ESP);
+
+    let new_cpl = cs_descriptor.dpl();
+    let switch_stack = !cs_descriptor.is_dc() && new_cpl < *cpl;
+    let ist = descriptor.ist();
+
+    // In 64-bit mode the exception frame is always 5 slots: SS:RSP are pushed
+    // regardless of privilege change (Intel SDM Vol. 3A, "Exception and
+    // Interrupt Handling in 64-bit Mode")
+    let mut frame_size: u64 = 40; // rip, cs, rflags, rsp, ss
+    if error_code.is_some() {
+        frame_size += 8;
+    }
+
+    let stack_base: u64 = if switch_stack || ist != 0 {
+        if ist != 0 {
+            return_on_pagefault!(get_tss_ist64(ist))
+        }
+        else {
+            return_on_pagefault!(get_tss_rsp64(new_cpl))
+        }
+    }
+    else {
+        old_rsp
+    };
+
+    // Switch to the target privilege level *before* the workability checks and
+    // pushes: the hardware pushes the interrupt frame with supervisor
+    // privileges even when it the interrupted context was userland.
+    *cpl = new_cpl;
+    cpl_changed();
+
+    // check that the frame fits (linear, ss base is 0 in 64-bit mode)
+    return_on_pagefault!(writable_or_pagefault(
+        stack_base.wrapping_sub(frame_size),
+        frame_size as i32
+    ));
+
+    // no exceptions below
+
+    *flags &= !FLAG_VM & !FLAG_RF;
+
+    if switch_stack {
+        // in long mode ss is set to null on an interrupt stack switch
+        *sreg.offset(SS as isize) = 0;
+        *segment_is_null.offset(SS as isize) = true;
+    }
+
+    // Push the frame the way the CPU does: ss, rsp, rflags, cs, rip and
+    // finally the error code, so that (from low to high addresses) the frame
+    // reads error, rip, cs, rflags, rsp, ss. SS:RSP are pushed unconditionally
+    // in long mode (see frame_size above).
+    let mut p = stack_base;
+    p = p.wrapping_sub(8);
+    return_on_pagefault!(safe_write64(p, old_ss));
+    p = p.wrapping_sub(8);
+    return_on_pagefault!(safe_write64(p, old_rsp));
+    p = p.wrapping_sub(8);
+    return_on_pagefault!(safe_write64(p, old_flags as u64));
+    p = p.wrapping_sub(8);
+    return_on_pagefault!(safe_write64(p, old_cs));
+    p = p.wrapping_sub(8);
+    return_on_pagefault!(safe_write64(p, old_rip));
+    if let Some(ec) = error_code {
+        p = p.wrapping_sub(8);
+        return_on_pagefault!(safe_write64(p, ec as u64));
+    }
+    dbg_assert!(p == stack_base.wrapping_sub(frame_size));
+    write_reg64(ESP, p);
+
+    *sreg.offset(CS as isize) = descriptor.selector() & !3 | *cpl as u16;
+    *segment_is_null.offset(CS as isize) = false;
+    *segment_limits.offset(CS as isize) = cs_descriptor.effective_limit();
+    *segment_offsets.offset(CS as isize) = 0;
+    *segment_access_bytes.offset(CS as isize) = cs_descriptor.access_byte();
+
+    update_cs_size(cs_descriptor.is_32(), cs_descriptor.is_64());
+
+    *instruction_pointer = offset;
+
+    *flags &= !FLAG_NT & !FLAG_RF & !FLAG_TRAP;
+
+    if !descriptor.is_trap_gate() {
+        // clear int flag for interrupt gates
+        *flags &= !FLAG_INTERRUPT;
+    }
+    else {
+        if *flags & FLAG_INTERRUPT != 0 && old_flags & FLAG_INTERRUPT == 0 {
+            handle_irqs();
+        }
+    }
+
+    update_state_flags();
 }
 
 pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool) {
@@ -1140,7 +1689,7 @@ pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool
             }
         }
         switch_cs_real_mode(selector);
-        *instruction_pointer = get_seg_cs() + eip;
+        *instruction_pointer = (get_seg_cs() as u32).wrapping_add(eip as u32) as u64;
         update_state_flags();
         return;
     }
@@ -1272,14 +1821,14 @@ pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool
                 if ss_info.is_32() {
                     return_on_pagefault!(writable_or_pagefault_cpl(
                         cs_info.dpl(),
-                        ss_info.base() + new_esp - stack_space,
+                        (ss_info.base() + new_esp - stack_space) as u32 as u64,
                         stack_space
                     ));
                 }
                 else {
                     return_on_pagefault!(writable_or_pagefault_cpl(
                         cs_info.dpl(),
-                        ss_info.base() + (new_esp - stack_space & 0xFFFF),
+                        (ss_info.base() + (new_esp - stack_space & 0xFFFF)) as u32 as u64,
                         stack_space
                     ));
                 }
@@ -1293,7 +1842,7 @@ pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool
                 *cpl = cs_info.dpl();
                 cpl_changed();
 
-                update_cs_size(cs_info.is_32());
+                update_cs_size(cs_info.is_32(), cs_info.is_64());
 
                 dbg_assert!(new_ss & 3 == cs_info.dpl() as i32);
                 // XXX: Should be checked before side effects
@@ -1317,7 +1866,7 @@ pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool
                 if is_call {
                     if is_16 {
                         for i in (0..parameter_count).rev() {
-                            let parameter = safe_read16(old_stack_pointer + 2 * i).unwrap();
+                            let parameter = safe_read16(old_stack_pointer + 2 * i as u64).unwrap();
                             push16(parameter).unwrap();
                         }
 
@@ -1327,7 +1876,7 @@ pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool
                     }
                     else {
                         for i in (0..parameter_count).rev() {
-                            let parameter = safe_read32s(old_stack_pointer + 4 * i).unwrap();
+                            let parameter = safe_read32s(old_stack_pointer + 4 * i as u64).unwrap();
                             push32(parameter).unwrap();
                         }
 
@@ -1378,7 +1927,7 @@ pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool
             );
             dbg_assert!((new_eip as u32) <= cs_info.effective_limit(), "todo: #gp");
 
-            update_cs_size(cs_info.is_32());
+            update_cs_size(cs_info.is_32(), cs_info.is_64());
 
             *segment_is_null.offset(CS as isize) = false;
             *segment_limits.offset(CS as isize) = cs_info.effective_limit();
@@ -1387,7 +1936,7 @@ pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool
             *sreg.offset(CS as isize) = cs_selector as u16 & !3 | *cpl as u16;
             dbg_assert!(*sreg.offset(CS as isize) & 3 == *cpl as u16);
 
-            *instruction_pointer = get_seg_cs() + new_eip;
+            *instruction_pointer = (get_seg_cs() as u32).wrapping_add(new_eip as u32) as u64;
 
             update_state_flags();
         }
@@ -1485,7 +2034,7 @@ pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool
 
         dbg_assert!((eip as u32) <= info.effective_limit(), "todo: #gp");
 
-        update_cs_size(info.is_32());
+        update_cs_size(info.is_32(), info.is_64());
 
         *segment_is_null.offset(CS as isize) = false;
         *segment_limits.offset(CS as isize) = info.effective_limit();
@@ -1494,10 +2043,145 @@ pub unsafe fn far_jump(eip: i32, selector: i32, is_call: bool, is_osize_32: bool
         *segment_offsets.offset(CS as isize) = info.base();
         *sreg.offset(CS as isize) = selector as u16 & !3 | *cpl as u16;
 
-        *instruction_pointer = get_seg_cs() + eip;
+        *instruction_pointer = (get_seg_cs() as u32).wrapping_add(eip as u32) as u64;
 
         update_state_flags();
     }
+}
+
+/// 64-bit far return (retfq): pop rip, cs (and rsp, ss on a privilege change).
+/// rip is the value popped by the caller; the stack has been advanced past it.
+pub unsafe fn far_return64(rip: u64, selector: i32, stack_adjust: u64) {
+    let cs_selector = SegmentSelector::of_u16(selector as u16);
+    let info = match return_on_pagefault!(lookup_segment_selector(cs_selector)) {
+        Ok((desc, _)) => desc,
+        Err(SelectorNullOrInvalid::IsNull) | Err(SelectorNullOrInvalid::OutsideOfTableLimit) => {
+            dbg_log!("far return64: #gp invalid cs: {:x}", selector);
+            trigger_gp(selector & !3);
+            return;
+        },
+    };
+
+    if info.is_system() || !info.is_executable() || !info.is_present() {
+        dbg_log!("far return64: #gp cs is not a present code segment");
+        trigger_gp(selector & !3);
+        return;
+    }
+    if cs_selector.rpl() < *cpl {
+        dbg_log!("far return64: #gp rpl < cpl");
+        trigger_gp(selector & !3);
+        return;
+    }
+    if !info.is_dc() && cs_selector.rpl() != info.dpl() {
+        dbg_log!("far return64: #gp non-conforming cs and rpl != dpl");
+        trigger_gp(selector & !3);
+        return;
+    }
+
+    if cs_selector.rpl() > *cpl {
+        // outer privilege return: pop rsp and ss
+        let new_rsp = return_on_pagefault!(pop64());
+        let new_ss = return_on_pagefault!(pop64()) as u16;
+        let ss_selector = SegmentSelector::of_u16(new_ss);
+        let ss_descriptor = match return_on_pagefault!(lookup_segment_selector(ss_selector)) {
+            Ok((desc, _)) => desc,
+            Err(SelectorNullOrInvalid::IsNull) | Err(SelectorNullOrInvalid::OutsideOfTableLimit) => {
+                dbg_log!("far return64: #gp invalid ss: {:x}", new_ss);
+                trigger_gp(new_ss as i32 & !3);
+                return;
+            },
+        };
+        if ss_descriptor.is_system()
+            || ss_selector.rpl() != cs_selector.rpl()
+            || !ss_descriptor.is_writable()
+            || ss_descriptor.dpl() != cs_selector.rpl()
+            || !ss_descriptor.is_present()
+        {
+            dbg_log!("far return64: #gp/#ss invalid ss descriptor");
+            trigger_gp(new_ss as i32 & !3);
+            return;
+        }
+        // no exceptions below
+        *cpl = cs_selector.rpl();
+        cpl_changed();
+        write_reg64(ESP, new_rsp);
+        if !switch_seg(SS, new_ss as i32) {
+            dbg_assert!(false);
+        }
+    }
+    else {
+        write_reg64(ESP, read_reg64(ESP).wrapping_add(stack_adjust));
+    }
+
+    // no exceptions below
+
+    *sreg.offset(CS as isize) = selector as u16 & !3 | *cpl as u16;
+    *segment_is_null.offset(CS as isize) = false;
+    *segment_limits.offset(CS as isize) = info.effective_limit();
+    *segment_offsets.offset(CS as isize) = if *is_64 { 0 } else { info.base() };
+    *segment_access_bytes.offset(CS as isize) = info.access_byte();
+
+    update_cs_size(info.is_32(), info.is_64());
+
+    *instruction_pointer = rip;
+
+    update_state_flags();
+}
+
+/// 64-bit far call/jmp (m16:64 or m16:32 with 64-bit submode semantics).
+pub unsafe fn far_jump64(rip: u64, selector: i32, is_call: bool) {
+    let cs_selector = SegmentSelector::of_u16(selector as u16);
+    let info = match return_on_pagefault!(lookup_segment_selector(cs_selector)) {
+        Ok((desc, _)) => desc,
+        Err(SelectorNullOrInvalid::IsNull) | Err(SelectorNullOrInvalid::OutsideOfTableLimit) => {
+            dbg_log!("far jump64: #gp invalid cs: {:x}", selector);
+            trigger_gp(selector & !3);
+            return;
+        },
+    };
+
+    if info.is_system() || !info.is_executable() || !info.is_present() {
+        dbg_log!("far jump64: #gp cs is not a present code segment");
+        trigger_gp(selector & !3);
+        return;
+    }
+    if !info.is_64() {
+        dbg_log!("far jump64: #gp cs is not 64-bit in long mode");
+        trigger_gp(selector & !3);
+        return;
+    }
+
+    if info.is_dc() || info.dpl() == *cpl {
+        // intra-privilege
+    }
+    else if !info.is_dc() && info.dpl() < *cpl {
+        // call through a call gate to a more privileged level: not supported
+        dbg_log!("far call64 to outer privilege: unimplemented");
+        trigger_gp(selector & !3);
+        return;
+    }
+    else {
+        dbg_log!("far jump64: #gp dpl > cpl");
+        trigger_gp(selector & !3);
+        return;
+    }
+
+    if is_call {
+        return_on_pagefault!(push64(*sreg.offset(CS as isize) as u64));
+        return_on_pagefault!(push64(*instruction_pointer));
+    }
+
+    *sreg.offset(CS as isize) = selector as u16 & !3 | *cpl as u16;
+    *segment_is_null.offset(CS as isize) = false;
+    *segment_limits.offset(CS as isize) = info.effective_limit();
+    *segment_offsets.offset(CS as isize) = 0;
+    *segment_access_bytes.offset(CS as isize) = info.access_byte();
+
+    update_cs_size(info.is_32(), info.is_64());
+
+    *instruction_pointer = rip;
+
+    update_state_flags();
 }
 
 pub unsafe fn far_return(eip: i32, selector: i32, stack_adjust: i32, is_osize_32: bool) {
@@ -1509,7 +2193,7 @@ pub unsafe fn far_return(eip: i32, selector: i32, stack_adjust: i32, is_osize_32
 
     if !*protected_mode || vm86_mode() {
         switch_cs_real_mode(selector);
-        *instruction_pointer = get_seg_cs() + eip;
+        *instruction_pointer = (get_seg_cs() as u32).wrapping_add(eip as u32) as u64;
         adjust_stack_reg(2 * (if is_osize_32 { 4 } else { 2 }) + stack_adjust);
         update_state_flags();
         return;
@@ -1635,7 +2319,7 @@ pub unsafe fn far_return(eip: i32, selector: i32, stack_adjust: i32, is_osize_32
 
     //dbg_assert(*cpl == info.dpl);
 
-    update_cs_size(info.is_32());
+    update_cs_size(info.is_32(), info.is_64());
 
     *segment_is_null.offset(CS as isize) = false;
     *segment_limits.offset(CS as isize) = info.effective_limit();
@@ -1645,7 +2329,7 @@ pub unsafe fn far_return(eip: i32, selector: i32, stack_adjust: i32, is_osize_32
     *sreg.offset(CS as isize) = selector as u16;
     dbg_assert!(selector & 3 == *cpl as i32);
 
-    *instruction_pointer = get_seg_cs() + eip;
+    *instruction_pointer = (get_seg_cs() as u32).wrapping_add(eip as u32) as u64;
 
     update_state_flags();
 }
@@ -1704,32 +2388,32 @@ pub unsafe fn do_task_switch(selector: i32, error_code: Option<i32>, source: Tas
         old_eflags &= !FLAG_NT;
     }
 
-    writable_or_pagefault(tsr_offset, 0x66).unwrap();
+    writable_or_pagefault(tsr_offset as u32 as u64, 0x66).unwrap();
 
-    //safe_write32(tsr_offset + TSR_CR3, *cr.offset(3));
+    //safe_write32((tsr_offset + TSR_CR3) as u32 as u64, *cr.offset(3));
 
     // TODO: Write 16 bit values if old tss is 16 bit
-    safe_write32(tsr_offset + TSR_EIP, get_real_eip()).unwrap();
-    safe_write32(tsr_offset + TSR_EFLAGS, old_eflags).unwrap();
+    safe_write32((tsr_offset + TSR_EIP) as u32 as u64, get_real_eip()).unwrap();
+    safe_write32((tsr_offset + TSR_EFLAGS) as u32 as u64, old_eflags).unwrap();
 
-    safe_write32(tsr_offset + TSR_EAX, read_reg32(EAX)).unwrap();
-    safe_write32(tsr_offset + TSR_ECX, read_reg32(ECX)).unwrap();
-    safe_write32(tsr_offset + TSR_EDX, read_reg32(EDX)).unwrap();
-    safe_write32(tsr_offset + TSR_EBX, read_reg32(EBX)).unwrap();
+    safe_write32((tsr_offset + TSR_EAX) as u32 as u64, read_reg32(EAX)).unwrap();
+    safe_write32((tsr_offset + TSR_ECX) as u32 as u64, read_reg32(ECX)).unwrap();
+    safe_write32((tsr_offset + TSR_EDX) as u32 as u64, read_reg32(EDX)).unwrap();
+    safe_write32((tsr_offset + TSR_EBX) as u32 as u64, read_reg32(EBX)).unwrap();
 
-    safe_write32(tsr_offset + TSR_ESP, read_reg32(ESP)).unwrap();
-    safe_write32(tsr_offset + TSR_EBP, read_reg32(EBP)).unwrap();
-    safe_write32(tsr_offset + TSR_ESI, read_reg32(ESI)).unwrap();
-    safe_write32(tsr_offset + TSR_EDI, read_reg32(EDI)).unwrap();
+    safe_write32((tsr_offset + TSR_ESP) as u32 as u64, read_reg32(ESP)).unwrap();
+    safe_write32((tsr_offset + TSR_EBP) as u32 as u64, read_reg32(EBP)).unwrap();
+    safe_write32((tsr_offset + TSR_ESI) as u32 as u64, read_reg32(ESI)).unwrap();
+    safe_write32((tsr_offset + TSR_EDI) as u32 as u64, read_reg32(EDI)).unwrap();
 
-    safe_write32(tsr_offset + TSR_ES, *sreg.offset(ES as isize) as i32).unwrap();
-    safe_write32(tsr_offset + TSR_CS, *sreg.offset(CS as isize) as i32).unwrap();
-    safe_write32(tsr_offset + TSR_SS, *sreg.offset(SS as isize) as i32).unwrap();
-    safe_write32(tsr_offset + TSR_DS, *sreg.offset(DS as isize) as i32).unwrap();
-    safe_write32(tsr_offset + TSR_FS, *sreg.offset(FS as isize) as i32).unwrap();
-    safe_write32(tsr_offset + TSR_GS, *sreg.offset(GS as isize) as i32).unwrap();
+    safe_write32((tsr_offset + TSR_ES) as u32 as u64, *sreg.offset(ES as isize) as i32).unwrap();
+    safe_write32((tsr_offset + TSR_CS) as u32 as u64, *sreg.offset(CS as isize) as i32).unwrap();
+    safe_write32((tsr_offset + TSR_SS) as u32 as u64, *sreg.offset(SS as isize) as i32).unwrap();
+    safe_write32((tsr_offset + TSR_DS) as u32 as u64, *sreg.offset(DS as isize) as i32).unwrap();
+    safe_write32((tsr_offset + TSR_FS) as u32 as u64, *sreg.offset(FS as isize) as i32).unwrap();
+    safe_write32((tsr_offset + TSR_GS) as u32 as u64, *sreg.offset(GS as isize) as i32).unwrap();
 
-    //safe_write32(tsr_offset + TSR_LDT, *sreg.offset(reg_ldtr));
+    //safe_write32((tsr_offset + TSR_LDT) as u32 as u64, *sreg.offset(reg_ldtr));
 
     if source == TaskSwitchSource::Jump || source == TaskSwitchSource::Iret {
         // mark the old task as not busy
@@ -1741,12 +2425,12 @@ pub unsafe fn do_task_switch(selector: i32, error_code: Option<i32>, source: Tas
                     panic!("#TS handler");
                 },
             };
-        safe_write64(tr_descriptor_address, tr_descriptor.clear_busy().raw).unwrap();
+        safe_write64(tr_descriptor_address as u64, tr_descriptor.clear_busy().raw).unwrap();
     }
 
     if source != TaskSwitchSource::Iret {
         // jump, call and int mark the new task as busy (iret would not)
-        safe_write64(descriptor_address, descriptor.set_busy().raw).unwrap();
+        safe_write64(descriptor_address as u64, descriptor.set_busy().raw).unwrap();
     }
 
     //let new_tsr_size = descriptor.effective_limit;
@@ -1756,21 +2440,21 @@ pub unsafe fn do_task_switch(selector: i32, error_code: Option<i32>, source: Tas
 
     if source == TaskSwitchSource::CallOrInt {
         safe_write16(
-            new_tsr_offset + TSR_BACKLINK,
+            (new_tsr_offset + TSR_BACKLINK) as u32 as u64,
             *sreg.offset(TR as isize) as i32,
         )
         .unwrap();
     }
 
-    let new_cr3 = safe_read32s(new_tsr_offset + TSR_CR3).unwrap();
+    let new_cr3 = safe_read32s((new_tsr_offset + TSR_CR3) as u32 as u64).unwrap();
 
     *flags &= !FLAG_VM;
 
-    let new_eip = safe_read32s(new_tsr_offset + TSR_EIP).unwrap();
-    let new_cs = safe_read16(new_tsr_offset + TSR_CS).unwrap();
-    let new_ldt = safe_read16(new_tsr_offset + TSR_LDT).unwrap();
+    let new_eip = safe_read32s((new_tsr_offset + TSR_EIP) as u32 as u64).unwrap();
+    let new_cs = safe_read16((new_tsr_offset + TSR_CS) as u32 as u64).unwrap();
+    let new_ldt = safe_read16((new_tsr_offset + TSR_LDT) as u32 as u64).unwrap();
 
-    let mut new_eflags = safe_read32s(new_tsr_offset + TSR_EFLAGS).unwrap();
+    let mut new_eflags = safe_read32s((new_tsr_offset + TSR_EFLAGS) as u32 as u64).unwrap();
     if source == TaskSwitchSource::CallOrInt {
         new_eflags |= FLAG_NT;
     }
@@ -1782,7 +2466,7 @@ pub unsafe fn do_task_switch(selector: i32, error_code: Option<i32>, source: Tas
         *segment_is_null.offset(CS as isize) = false;
         *segment_offsets.offset(CS as isize) = new_cs << 4;
         *sreg.offset(CS as isize) = new_cs as u16;
-        update_cs_size(false);
+        update_cs_size(false, false);
         new_cpl = 3;
     }
     else {
@@ -1833,7 +2517,7 @@ pub unsafe fn do_task_switch(selector: i32, error_code: Option<i32>, source: Tas
             new_eip as u32 <= new_cs_descriptor.effective_limit(),
             "todo: #gp"
         );
-        update_cs_size(new_cs_descriptor.is_32());
+        update_cs_size(new_cs_descriptor.is_32(), new_cs_descriptor.is_64());
 
         new_cpl = new_cs_selector.rpl();
     }
@@ -1851,28 +2535,32 @@ pub unsafe fn do_task_switch(selector: i32, error_code: Option<i32>, source: Tas
         *flags |= FLAG_NT;
     }
 
-    write_reg32(EAX, safe_read32s(new_tsr_offset + TSR_EAX).unwrap());
-    write_reg32(ECX, safe_read32s(new_tsr_offset + TSR_ECX).unwrap());
-    write_reg32(EDX, safe_read32s(new_tsr_offset + TSR_EDX).unwrap());
-    write_reg32(EBX, safe_read32s(new_tsr_offset + TSR_EBX).unwrap());
+    write_reg32(EAX, safe_read32s((new_tsr_offset + TSR_EAX) as u32 as u64).unwrap());
+    write_reg32(ECX, safe_read32s((new_tsr_offset + TSR_ECX) as u32 as u64).unwrap());
+    write_reg32(EDX, safe_read32s((new_tsr_offset + TSR_EDX) as u32 as u64).unwrap());
+    write_reg32(EBX, safe_read32s((new_tsr_offset + TSR_EBX) as u32 as u64).unwrap());
 
-    write_reg32(ESP, safe_read32s(new_tsr_offset + TSR_ESP).unwrap());
-    write_reg32(EBP, safe_read32s(new_tsr_offset + TSR_EBP).unwrap());
-    write_reg32(ESI, safe_read32s(new_tsr_offset + TSR_ESI).unwrap());
-    write_reg32(EDI, safe_read32s(new_tsr_offset + TSR_EDI).unwrap());
+    write_reg32(ESP, safe_read32s((new_tsr_offset + TSR_ESP) as u32 as u64).unwrap());
+    write_reg32(EBP, safe_read32s((new_tsr_offset + TSR_EBP) as u32 as u64).unwrap());
+    write_reg32(ESI, safe_read32s((new_tsr_offset + TSR_ESI) as u32 as u64).unwrap());
+    write_reg32(EDI, safe_read32s((new_tsr_offset + TSR_EDI) as u32 as u64).unwrap());
 
-    if !switch_seg(ES, safe_read16(new_tsr_offset + TSR_ES).unwrap())
-        || !switch_seg(SS, safe_read16(new_tsr_offset + TSR_SS).unwrap())
-        || !switch_seg(DS, safe_read16(new_tsr_offset + TSR_DS).unwrap())
-        || !switch_seg(FS, safe_read16(new_tsr_offset + TSR_FS).unwrap())
-        || !switch_seg(GS, safe_read16(new_tsr_offset + TSR_GS).unwrap())
+    if !switch_seg(ES, safe_read16((new_tsr_offset + TSR_ES) as u32 as u64).unwrap())
+        || !switch_seg(SS, safe_read16((new_tsr_offset + TSR_SS) as u32 as u64).unwrap())
+        || !switch_seg(DS, safe_read16((new_tsr_offset + TSR_DS) as u32 as u64).unwrap())
+        || !switch_seg(FS, safe_read16((new_tsr_offset + TSR_FS) as u32 as u64).unwrap())
+        || !switch_seg(GS, safe_read16((new_tsr_offset + TSR_GS) as u32 as u64).unwrap())
     {
         // XXX: Should be checked before side effects
         dbg_assert!(false);
     }
 
-    *instruction_pointer =
-        get_seg_cs() + if new_eflags & FLAG_VM != 0 { new_eip & 0xFFFF } else { new_eip };
+    *instruction_pointer = (get_seg_cs() as u32).wrapping_add(if new_eflags & FLAG_VM != 0 {
+        new_eip as u32 & 0xFFFF
+    }
+    else {
+        new_eip as u32
+    }) as u64;
 
     *segment_offsets.offset(TR as isize) = descriptor.base();
     *segment_limits.offset(TR as isize) = descriptor.effective_limit();
@@ -1914,61 +2602,61 @@ pub unsafe fn get_eflags() -> i32 {
         | (getof() as i32) << 11;
 }
 
-pub unsafe fn readable_or_pagefault(addr: i32, size: i32) -> OrPageFault<()> {
+pub unsafe fn readable_or_pagefault(addr: u64, size: i32) -> OrPageFault<()> {
     dbg_assert!(size < 0x1000);
     dbg_assert!(size > 0);
 
     let user = *cpl == 3;
     translate_address(addr, false, user, false, true)?;
 
-    let end = addr + size - 1 & !0xFFF;
-    if addr & !0xFFF != end & !0xFFF {
+    let end = addr.wrapping_add(size as u64).wrapping_sub(1) & !0xFFF;
+    if addr & !0xFFF != end {
         translate_address(end, false, user, false, true)?;
     }
 
     return Ok(());
 }
 
-pub unsafe fn writable_or_pagefault(addr: i32, size: i32) -> OrPageFault<()> {
+pub unsafe fn writable_or_pagefault(addr: u64, size: i32) -> OrPageFault<()> {
     writable_or_pagefault_cpl(*cpl, addr, size)
 }
 
-pub unsafe fn writable_or_pagefault_cpl(other_cpl: u8, addr: i32, size: i32) -> OrPageFault<()> {
+pub unsafe fn writable_or_pagefault_cpl(other_cpl: u8, addr: u64, size: i32) -> OrPageFault<()> {
     dbg_assert!(size < 0x1000);
     dbg_assert!(size > 0);
 
     let user = other_cpl == 3;
     translate_address(addr, true, user, false, true)?;
 
-    let end = addr + size - 1 & !0xFFF;
-    if addr & !0xFFF != end & !0xFFF {
+    let end = addr.wrapping_add(size as u64).wrapping_sub(1) & !0xFFF;
+    if addr & !0xFFF != end {
         translate_address(end, true, user, false, true)?;
     }
 
     return Ok(());
 }
 
-pub fn translate_address_read_no_side_effects(address: i32) -> OrPageFault<u32> {
+pub fn translate_address_read_no_side_effects(address: u64) -> OrPageFault<u32> {
     unsafe { translate_address(address, false, *cpl == 3, false, false) }
 }
-pub fn translate_address_read(address: i32) -> OrPageFault<u32> {
+pub fn translate_address_read(address: u64) -> OrPageFault<u32> {
     unsafe { translate_address(address, false, *cpl == 3, false, true) }
 }
-pub unsafe fn translate_address_read_jit(address: i32) -> OrPageFault<u32> {
+pub unsafe fn translate_address_read_jit(address: u64) -> OrPageFault<u32> {
     translate_address(address, false, *cpl == 3, true, true)
 }
 
-pub unsafe fn translate_address_write(address: i32) -> OrPageFault<u32> {
+pub unsafe fn translate_address_write(address: u64) -> OrPageFault<u32> {
     translate_address(address, true, *cpl == 3, false, true)
 }
-pub unsafe fn translate_address_write_jit(address: i32, wasm_table_index: u16) -> OrPageFault<u32> {
-    let mut entry = tlb_data[(address as u32 >> 12) as usize];
+pub unsafe fn translate_address_write_jit(address: u64, wasm_table_index: u16) -> OrPageFault<u32> {
+    let mut entry = tlb_pick_entry(address);
     let user = *cpl == 3;
-    if entry & (TLB_VALID | if user { TLB_NO_USER } else { 0 } | TLB_READONLY) != TLB_VALID {
-        entry = do_page_walk(address, true, user, true, true)?.get();
+    if entry as i32 & (TLB_VALID | if user { TLB_NO_USER } else { 0 } | TLB_READONLY) != TLB_VALID {
+        entry = do_page_walk(address, true, user, true, true, false)?;
     }
-    let has_code = entry & TLB_HAS_CODE != 0;
-    let phys_addr = (entry & !0xFFF ^ address) as u32 - memory::mem8 as u32;
+    let has_code = entry as i32 & TLB_HAS_CODE != 0;
+    let phys_addr = ((entry & !0xFFF) ^ address) as u32 - memory::mem8 as u32;
     let page = Page::page_of(phys_addr);
     if !has_code {
         return Ok(phys_addr);
@@ -1988,42 +2676,42 @@ pub unsafe fn translate_address_write_jit(address: i32, wasm_table_index: u16) -
     Err(())
 }
 
-pub unsafe fn translate_address_system_read(address: i32) -> OrPageFault<u32> {
+pub unsafe fn translate_address_system_read(address: u64) -> OrPageFault<u32> {
     translate_address(address, false, false, false, true)
 }
-pub unsafe fn translate_address_system_write(address: i32) -> OrPageFault<u32> {
+pub unsafe fn translate_address_system_write(address: u64) -> OrPageFault<u32> {
     translate_address(address, true, false, false, true)
 }
 
 #[inline(always)]
 pub unsafe fn translate_address(
-    address: i32,
+    address: u64,
     for_writing: bool,
     user: bool,
     jit: bool,
     side_effects: bool,
 ) -> OrPageFault<u32> {
-    let mut entry = tlb_data[(address as u32 >> 12) as usize];
-    if entry
+    let mut entry = tlb_pick_entry(address);
+    if entry as i32
         & (TLB_VALID
             | if user { TLB_NO_USER } else { 0 }
             | if for_writing { TLB_READONLY } else { 0 })
         != TLB_VALID
     {
-        entry = do_page_walk(address, for_writing, user, jit, side_effects)?.get();
+        entry = do_page_walk(address, for_writing, user, jit, side_effects, false)?;
     }
-    Ok((entry & !0xFFF ^ address) as u32 - memory::mem8 as u32)
+    Ok(((entry & !0xFFF) ^ address) as u32 - memory::mem8 as u32)
 }
 
-pub unsafe fn translate_address_write_and_can_skip_dirty(address: i32) -> OrPageFault<(u32, bool)> {
-    let mut entry = tlb_data[(address as u32 >> 12) as usize];
+pub unsafe fn translate_address_write_and_can_skip_dirty(address: u64) -> OrPageFault<(u32, bool)> {
+    let mut entry = tlb_pick_entry(address);
     let user = *cpl == 3;
-    if entry & (TLB_VALID | if user { TLB_NO_USER } else { 0 } | TLB_READONLY) != TLB_VALID {
-        entry = do_page_walk(address, true, user, false, true)?.get();
+    if entry as i32 & (TLB_VALID | if user { TLB_NO_USER } else { 0 } | TLB_READONLY) != TLB_VALID {
+        entry = do_page_walk(address, true, user, false, true, false)?;
     }
     Ok((
-        (entry & !0xFFF ^ address) as u32 - memory::mem8 as u32,
-        entry & TLB_HAS_CODE == 0,
+        ((entry & !0xFFF) ^ address) as u32 - memory::mem8 as u32,
+        entry as i32 & TLB_HAS_CODE == 0,
     ))
 }
 
@@ -2035,81 +2723,190 @@ pub unsafe fn translate_address_write_and_can_skip_dirty(address: i32) -> OrPage
 // - 2 bits PDPT | 9 bits PD | 9 bits PT | 12 bits offset
 // - 2 bits PDPT | 9 bits PD | 21 bits offset (2MB huge page)
 //
+// Long mode (4-level paging):
+// - 9 bits PML4 | 9 bits PDPT | 9 bits PD | 9 bits PT | 12 bits offset
+// - 9 bits PML4 | 9 bits PDPT | 9 bits PD | 21 bits offset (2MB huge page)
+//
 // Note that PAE entries are 64-bit, and can describe physical addresses over 32
 // bits. However, since we support only 32-bit physical addresses, we require
 // the high half of the entry to be 0.
 #[cold]
 pub unsafe fn do_page_walk(
-    addr: i32,
+    addr: u64,
     for_writing: bool,
     user: bool,
     jit: bool,
     side_effects: bool,
-) -> OrPageFault<std::num::NonZeroI32> {
+    for_fetch: bool,
+) -> OrPageFault<u64> {
     let global;
     let mut allow_user = true;
-    let page = (addr as u32 >> 12) as i32;
+    // accumulated write permission of upper paging levels (long mode only)
+    let mut allow_write_upper = true;
+    // accumulated NX permission of upper paging levels (long mode only)
+    let mut allow_fetch = true;
+    // CR2 receives the full linear address on #PF (real hardware stores the
+    // effective address as generated, sign-extension bits included; Linux's
+    // early_make_pgtable recovers the physical address from it, so squashing
+    // to the low 48 bits breaks the early physmap demand-fault handler)
+    let fault_addr = addr;
+    let addr = canonicalize_address(addr);
+    let page = addr >> 12;
     let high;
 
     let cr0 = *cr;
     let cr4 = *cr.offset(4);
+    // I/D (bit 4) of the page-fault error code: set for instruction fetches
+    // when EFER.NXE or CR4.SMEP is enabled (matches PAE/long-mode hw behavior
+    // and kvm-unit-tests' expectations)
+    let pfec_fetch = for_fetch && (*efer & EFER_NXE != 0 || cr4 & CR4_SMEP != 0);
+    // fetch faults determined by the final permissions (NX, SMEP): raised
+    // before any accessed/dirty bits touch the entries
+    let long_mode_nx = *efer & EFER_LMA != 0 && *efer & EFER_NXE != 0;
+    let nx_fetch_fault = for_fetch && long_mode_nx;
+    let smep_fetch_fault = for_fetch && cr0 & CR0_PG != 0 && cr4 & CR4_SMEP != 0 && !user;
 
     if cr0 & CR0_PG == 0 {
         // paging disabled
-        high = addr as u32 & 0xFFFFF000;
+        high = (addr & 0xFFFF_F000) as u32;
         global = false
     }
     else {
         profiler::stat_increment(stat::TLB_MISS);
 
+            let long_mode = *efer & EFER_LMA != 0;
         let pae = cr4 & CR4_PAE != 0;
 
-        let (page_dir_addr, page_dir_entry) = if pae {
-            let pdpt_entry = *reg_pdpte.offset(((addr as u32) >> 30) as isize);
+
+        let (page_dir_addr, page_dir_entry) = if long_mode {
+            // 4-level paging: PML4 → PDPT → PD (→ PT)
+            dbg_assert!(pae, "Long mode requires PAE");
+
+            let pml4_addr = (*cr.offset(3) as u32 & 0xFFFF_F000) + ((addr >> 39 & 0x1FF) << 3) as u32;
+            let pml4_entry = memory::read64s(pml4_addr) as u64;
+            if pml4_entry & (PAGE_TABLE_PRESENT_MASK as u64) == 0 {
+                if side_effects {
+                    trigger_pagefault_extended(fault_addr, for_writing, user, pfec_fetch, false, false, jit);
+                }
+                return Err(());
+            }
+            if pml4_entry & PAE_ENTRY_RSVD != 0
+                || *efer & EFER_NXE == 0 && pml4_entry & (1u64 << 63) != 0
+            {
+                if side_effects {
+                    trigger_pagefault_extended(fault_addr, for_writing, user, pfec_fetch, true, true, jit);
+                }
+                return Err(());
+            }
+            allow_user &= pml4_entry & (PAGE_TABLE_USER_MASK as u64) != 0;
+            allow_write_upper &= pml4_entry & (PAGE_TABLE_RW_MASK as u64) != 0;
+            allow_fetch &= pml4_entry & 0x8000_0000_0000_0000u64 == 0;
+            if side_effects && pml4_entry & (PAGE_TABLE_ACCESSED_MASK as u64) == 0 {
+                memory::write8(pml4_addr, (pml4_entry | PAGE_TABLE_ACCESSED_MASK as u64) as i32);
+            }
+
+            let pdpt_addr =
+                ((pml4_entry & 0x000F_FFFF_FFFF_F000) as u32) + (((addr >> 30) & 0x1FF) << 3) as u32;
+            let pdpt_entry = memory::read64s(pdpt_addr) as u64;
+            if pdpt_entry & (PAGE_TABLE_PRESENT_MASK as u64) == 0 {
+                if side_effects {
+                    trigger_pagefault_extended(fault_addr, for_writing, user, pfec_fetch, false, false, jit);
+                }
+                return Err(());
+            }
+            if pdpt_entry & PAE_ENTRY_RSVD != 0
+                || *efer & EFER_NXE == 0 && pdpt_entry & (1u64 << 63) != 0
+            {
+                if side_effects {
+                    trigger_pagefault_extended(fault_addr, for_writing, user, pfec_fetch, true, true, jit);
+                }
+                return Err(());
+            }
+            allow_user &= pdpt_entry & (PAGE_TABLE_USER_MASK as u64) != 0;
+            allow_write_upper &= pdpt_entry & (PAGE_TABLE_RW_MASK as u64) != 0;
+            allow_fetch &= pdpt_entry & 0x8000_0000_0000_0000u64 == 0;
+            dbg_assert!(
+                pdpt_entry & (PAGE_TABLE_PSE_MASK as u64) == 0,
+                "TODO: 1GB pages in long mode"
+            );
+            if side_effects && pdpt_entry & (PAGE_TABLE_ACCESSED_MASK as u64) == 0 {
+                memory::write8(pdpt_addr, (pdpt_entry | PAGE_TABLE_ACCESSED_MASK as u64) as i32);
+            }
+
+            let page_dir_addr =
+                ((pdpt_entry & 0x000F_FFFF_FFFF_F000) as u32) + (((addr >> 21) & 0x1FF) << 3) as u32;
+            let page_dir_entry = memory::read64s(page_dir_addr) as u64;
+
+            (page_dir_addr, page_dir_entry)
+        }
+        else if pae {
+            let pdpt_entry = *reg_pdpte.offset(((addr >> 30) & 3) as isize);
             if pdpt_entry as i32 & PAGE_TABLE_PRESENT_MASK == 0 {
                 if side_effects {
-                    trigger_pagefault(addr, false, for_writing, user, jit);
+                    trigger_pagefault_extended(fault_addr, for_writing, user, pfec_fetch, false, false, jit);
                 }
                 return Err(());
             }
 
             let page_dir_addr =
-                (pdpt_entry as u32 & 0xFFFFF000) + ((((addr as u32) >> 21) & 0x1FF) << 3);
-            let page_dir_entry = memory::read64s(page_dir_addr);
-            dbg_assert!(
-                page_dir_entry as u64 & 0x7FFF_FFFF_0000_0000 == 0,
-                "Unsupported: Page directory entry larger than 32 bits"
-            );
-            dbg_assert!(
-                page_dir_entry & 0x8000_0000_0000_0000u64 as i64 == 0,
-                "Unsupported: NX bit"
-            );
+                (pdpt_entry as u32 & 0xFFFF_F000) + (((addr >> 21) & 0x1FF) << 3) as u32;
+            let page_dir_entry = memory::read64s(page_dir_addr) as u64;
 
-            (page_dir_addr, page_dir_entry as i32)
+            (page_dir_addr, page_dir_entry)
         }
         else {
-            let page_dir_addr = *cr.offset(3) as u32 + (((addr as u32) >> 22) << 2);
-            let page_dir_entry = memory::read32s(page_dir_addr);
+            let page_dir_addr = *cr.offset(3) as u32 + (((addr >> 22) & 0x3FF) << 2) as u32;
+            let page_dir_entry = memory::read32s(page_dir_addr) as u64;
             (page_dir_addr, page_dir_entry)
         };
 
-        if page_dir_entry & PAGE_TABLE_PRESENT_MASK == 0 {
+        if page_dir_entry as i32 & PAGE_TABLE_PRESENT_MASK == 0 {
             if side_effects {
-                trigger_pagefault(addr, false, for_writing, user, jit);
+                trigger_pagefault_extended(fault_addr, for_writing, user, pfec_fetch, false, false, jit);
+            }
+            return Err(());
+        }
+        // reserved-bit faults: physical address bits beyond the supported 32
+        // bits (v86 maps memory below 4 GiB) and NX while EFER.NXE=0. Only
+        // 64-bit-entry (PAE/long-mode) formats; 32-bit entries are
+        // read32s-sign-extended, so gate on pae
+        if pae
+            && (page_dir_entry & PAE_ENTRY_RSVD != 0
+                || *efer & EFER_NXE == 0 && page_dir_entry & (1u64 << 63) != 0)
+        {
+            if side_effects {
+                trigger_pagefault_extended(fault_addr, for_writing, user, pfec_fetch, true, true, jit);
             }
             return Err(());
         }
 
         let kernel_write_override = !user && 0 == cr0 & CR0_WP;
-        let mut allow_write = page_dir_entry & PAGE_TABLE_RW_MASK != 0;
-        allow_user &= page_dir_entry & PAGE_TABLE_USER_MASK != 0;
+        let mut allow_write = page_dir_entry as i32 & PAGE_TABLE_RW_MASK != 0;
+        allow_write &= allow_write_upper;
+        allow_user &= page_dir_entry as i32 & PAGE_TABLE_USER_MASK != 0;
+        allow_fetch &= page_dir_entry & 0x8000_0000_0000_0000u64 == 0;
 
-        if 0 != page_dir_entry & PAGE_TABLE_PSE_MASK && 0 != cr4 & CR4_PSE {
+        if 0 != page_dir_entry as i32 & PAGE_TABLE_PSE_MASK && (long_mode || 0 != cr4 & CR4_PSE) {
             // size bit is set
 
+            if pae && page_dir_entry & PAE_PDE_PS_RSVD != 0 {
+                // reserved bits 20:13 in 2 MiB PDEs
+                if side_effects {
+                    trigger_pagefault_extended(fault_addr, for_writing, user, pfec_fetch, true, true, jit);
+                }
+                return Err(());
+            }
             if for_writing && !allow_write && !kernel_write_override || user && !allow_user {
                 if side_effects {
-                    trigger_pagefault(addr, true, for_writing, user, jit);
+                    trigger_pagefault_extended(fault_addr, for_writing, user, pfec_fetch, true, false, jit);
+                }
+                return Err(());
+            }
+            if nx_fetch_fault && !allow_fetch || smep_fetch_fault && allow_user {
+                // NX fetch fault / SMEP supervisor fetch of a user page: no
+                // accessed/dirty bits are set on a faulting fetch
+                if side_effects {
+                    trigger_pagefault_nx(fault_addr);
                 }
                 return Err(());
             }
@@ -2117,77 +2914,88 @@ pub unsafe fn do_page_walk(
             // set the accessed and dirty bits
 
             let new_page_dir_entry = page_dir_entry
-                | PAGE_TABLE_ACCESSED_MASK
-                | if for_writing { PAGE_TABLE_DIRTY_MASK } else { 0 };
+                | PAGE_TABLE_ACCESSED_MASK as u64
+                | if for_writing { PAGE_TABLE_DIRTY_MASK as u64 } else { 0 };
 
             if side_effects && page_dir_entry != new_page_dir_entry {
-                memory::write8(page_dir_addr, new_page_dir_entry);
+                memory::write8(page_dir_addr, new_page_dir_entry as i32);
             }
 
             high = if pae {
-                page_dir_entry as u32 & 0xFFE00000 | (addr & 0x1FF000) as u32
+                page_dir_entry as u32 & 0xFFE0_0000 | ((addr & 0x1FF000) as u32)
             }
             else {
-                page_dir_entry as u32 & 0xFFC00000 | (addr & 0x3FF000) as u32
+                page_dir_entry as u32 & 0xFFC0_0000 | ((addr & 0x3FF000) as u32)
             };
-            global = page_dir_entry & PAGE_TABLE_GLOBAL_MASK == PAGE_TABLE_GLOBAL_MASK
+            global = page_dir_entry as i32 & PAGE_TABLE_GLOBAL_MASK == PAGE_TABLE_GLOBAL_MASK
         }
         else {
             let (page_table_addr, page_table_entry) = if pae {
                 let page_table_addr =
-                    (page_dir_entry as u32 & 0xFFFFF000) + (((addr as u32 >> 12) & 0x1FF) << 3);
-                let page_table_entry = memory::read64s(page_table_addr);
-                dbg_assert!(
-                    page_table_entry as u64 & 0x7FFF_FFFF_0000_0000 == 0,
-                    "Unsupported: Page table entry larger than 32 bits"
-                );
-                dbg_assert!(
-                    page_table_entry & 0x8000_0000_0000_0000u64 as i64 == 0,
-                    "Unsupported: NX bit"
-                );
+                    (page_dir_entry as u32 & 0xFFFF_F000) + (((addr >> 12) & 0x1FF) << 3) as u32;
+                let page_table_entry = memory::read64s(page_table_addr) as u64;
 
-                (page_table_addr, page_table_entry as i32)
+                (page_table_addr, page_table_entry)
             }
             else {
                 let page_table_addr =
-                    (page_dir_entry as u32 & 0xFFFFF000) + (((addr as u32 >> 12) & 0x3FF) << 2);
-                let page_table_entry = memory::read32s(page_table_addr);
+                    (page_dir_entry as u32 & 0xFFFF_F000) + (((addr >> 12) & 0x3FF) << 2) as u32;
+                let page_table_entry = memory::read32s(page_table_addr) as u64;
                 (page_table_addr, page_table_entry)
             };
 
-            let present = page_table_entry & PAGE_TABLE_PRESENT_MASK != 0;
-            allow_write &= page_table_entry & PAGE_TABLE_RW_MASK != 0;
-            allow_user &= page_table_entry & PAGE_TABLE_USER_MASK != 0;
+            let present = page_table_entry as i32 & PAGE_TABLE_PRESENT_MASK != 0;
+            if pae
+                && present
+                && (page_table_entry & PAE_ENTRY_RSVD != 0
+                    || *efer & EFER_NXE == 0 && page_table_entry & (1u64 << 63) != 0)
+            {
+                if side_effects {
+                    trigger_pagefault_extended(fault_addr, for_writing, user, pfec_fetch, true, true, jit);
+                }
+                return Err(());
+            }
+            allow_write &= page_table_entry as i32 & PAGE_TABLE_RW_MASK != 0;
+            allow_user &= page_table_entry as i32 & PAGE_TABLE_USER_MASK != 0;
+            allow_fetch &= page_table_entry & 0x8000_0000_0000_0000u64 == 0;
 
             if !present
                 || for_writing && !allow_write && !kernel_write_override
                 || user && !allow_user
             {
                 if side_effects {
-                    trigger_pagefault(addr, present, for_writing, user, jit);
+                    trigger_pagefault_extended(fault_addr, for_writing, user, pfec_fetch, present, false, jit);
+                }
+                return Err(());
+            }
+            if nx_fetch_fault && !allow_fetch || smep_fetch_fault && allow_user {
+                // NX fetch fault / SMEP supervisor fetch of a user page: no
+                // accessed/dirty bits are set on a faulting fetch
+                if side_effects {
+                    trigger_pagefault_nx(fault_addr);
                 }
                 return Err(());
             }
 
             // Set the accessed and dirty bits
             // Note: dirty bit is only set on the page table entry
-            let new_page_dir_entry = page_dir_entry | PAGE_TABLE_ACCESSED_MASK;
+            let new_page_dir_entry = page_dir_entry | PAGE_TABLE_ACCESSED_MASK as u64;
             if side_effects && new_page_dir_entry != page_dir_entry {
-                memory::write8(page_dir_addr, new_page_dir_entry);
+                memory::write8(page_dir_addr, new_page_dir_entry as i32);
             }
             let new_page_table_entry = page_table_entry
-                | PAGE_TABLE_ACCESSED_MASK
-                | if for_writing { PAGE_TABLE_DIRTY_MASK } else { 0 };
+                | PAGE_TABLE_ACCESSED_MASK as u64
+                | if for_writing { PAGE_TABLE_DIRTY_MASK as u64 } else { 0 };
             if side_effects && page_table_entry != new_page_table_entry {
-                memory::write8(page_table_addr, new_page_table_entry);
+                memory::write8(page_table_addr, new_page_table_entry as i32);
             }
 
-            high = page_table_entry as u32 & 0xFFFFF000;
-            global = page_table_entry & PAGE_TABLE_GLOBAL_MASK == PAGE_TABLE_GLOBAL_MASK
+            high = page_table_entry as u32 & 0xFFFF_F000;
+            global = page_table_entry as i32 & PAGE_TABLE_GLOBAL_MASK == PAGE_TABLE_GLOBAL_MASK
         }
     }
 
-    if side_effects && tlb_data[page as usize] == 0 {
+    if side_effects && tlb_pick_entry(addr) == 0 {
         if valid_tlb_entries_count == VALID_TLB_ENTRY_MAX {
             profiler::stat_increment(stat::TLB_FULL);
             clear_tlb();
@@ -2204,16 +3012,6 @@ pub unsafe fn do_page_walk(
     // XXX: There will probably be duplicates due to invlpg deleting
     // entries from tlb_data but not from valid_tlb_entries
     }
-    else if side_effects && CHECK_TLB_INVARIANTS {
-        let mut found = false;
-        for i in 0..valid_tlb_entries_count {
-            if valid_tlb_entries[i as usize] == page {
-                found = true;
-                break;
-            }
-        }
-        dbg_assert!(found);
-    }
 
     let is_in_mapped_range = memory::in_mapped_range(high);
     let has_code = if side_effects {
@@ -2225,41 +3023,47 @@ pub unsafe fn do_page_walk(
         // address part)
         true
     };
+    // long_mode_nx computed at the top of this function
     let info_bits = TLB_VALID
         | if for_writing { 0 } else { TLB_READONLY }
         | if allow_user { 0 } else { TLB_NO_USER }
         | if is_in_mapped_range { TLB_IN_MAPPED_RANGE } else { 0 }
         | if global && 0 != cr4 & CR4_PGE { TLB_GLOBAL } else { 0 }
-        | if has_code { TLB_HAS_CODE } else { 0 };
+        | if has_code { TLB_HAS_CODE } else { 0 }
+        | if long_mode_nx && !allow_fetch { TLB_NOT_EXECUTABLE } else { 0 };
 
-    let tlb_entry = (high + memory::mem8 as u32) as i32 ^ page << 12 | info_bits as i32;
-
-    dbg_assert!((high ^ (page as u32) << 12) & 0xFFF == 0);
     if side_effects {
         // bake in the addition with memory::mem8 to save an instruction from the fast path
         // of memory accesses
-        tlb_data[page as usize] = tlb_entry;
+        let tlb_entry = ((high + memory::mem8 as u32) as u64)
+            ^ (page << 12)
+            | info_bits as u64;
+        dbg_assert!(high & 0xFFF == 0);
+        tlb_put_entry(addr, tlb_entry);
 
-        jit::update_tlb_code(Page::page_of(addr as u32), Page::page_of(high));
+        jit::update_tlb_code(page, Page::page_of(high));
     }
 
-    Ok(if DEBUG {
-        std::num::NonZeroI32::new(tlb_entry).unwrap()
-    }
-    else {
-        std::num::NonZeroI32::new_unchecked(tlb_entry)
-    })
+    Ok((high + memory::mem8 as u32) as u64 ^ (page << 12) | info_bits as u64)
 }
 
 #[no_mangle]
 pub unsafe fn full_clear_tlb() {
     profiler::stat_increment(stat::FULL_CLEAR_TLB);
     // clear tlb including global pages
-    *last_virt_eip = -1;
+    *last_virt_eip64 = -1;
     for i in 0..valid_tlb_entries_count {
-        let page = valid_tlb_entries[i as usize];
-        clear_tlb_code(page);
-        tlb_data[page as usize] = 0;
+        let page = valid_tlb_entries[i as usize] as u64;
+        if page < 0x10_0000 {
+            clear_tlb_code(page);
+            tlb_data[page as usize] = 0;
+        }
+        else {
+            let idx = tlb_high_index(page);
+            if tlb_high_page[idx] == page {
+                tlb_high_evict(idx);
+            }
+        }
     }
     valid_tlb_entries_count = 0;
 
@@ -2275,19 +3079,36 @@ pub unsafe fn full_clear_tlb() {
 pub unsafe fn clear_tlb() {
     profiler::stat_increment(stat::CLEAR_TLB);
     // clear tlb excluding global pages
-    *last_virt_eip = -1;
+    *last_virt_eip64 = -1;
     let mut global_page_offset = 0;
     for i in 0..valid_tlb_entries_count {
-        let page = valid_tlb_entries[i as usize];
-        let entry = tlb_data[page as usize];
+        let page = valid_tlb_entries[i as usize] as u64;
+        let entry = if page < 0x10_0000 {
+            tlb_data[page as usize]
+        }
+        else {
+            let idx = tlb_high_index(page);
+            if tlb_high_page[idx] == page {
+                tlb_high_entry[idx] as i32
+            }
+            else {
+                0
+            }
+        };
         if 0 != entry & TLB_GLOBAL {
             // reinsert at the front
             valid_tlb_entries[global_page_offset as usize] = page;
             global_page_offset += 1;
         }
-        else {
+        else if page < 0x10_0000 {
             clear_tlb_code(page);
             tlb_data[page as usize] = 0;
+        }
+        else {
+            let idx = tlb_high_index(page);
+            if tlb_high_page[idx] == page {
+                tlb_high_evict(idx);
+            }
         }
     }
     valid_tlb_entries_count = global_page_offset;
@@ -2304,7 +3125,7 @@ pub unsafe fn clear_tlb() {
 pub unsafe fn trigger_de_jit(eip_offset_in_page: i32) {
     dbg_log!("#de in jit mode");
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
-    *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
+    *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page as u64;
     jit_exit_reason = JitExitReason::CpuException {
         code: CPU_EXCEPTION_DE,
         error_code: None,
@@ -2315,7 +3136,7 @@ pub unsafe fn trigger_de_jit(eip_offset_in_page: i32) {
 pub unsafe fn trigger_ud_jit(eip_offset_in_page: i32) {
     dbg_log!("#ud in jit mode");
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
-    *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
+    *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page as u64;
     jit_exit_reason = JitExitReason::CpuException {
         code: CPU_EXCEPTION_UD,
         error_code: None,
@@ -2326,7 +3147,7 @@ pub unsafe fn trigger_ud_jit(eip_offset_in_page: i32) {
 pub unsafe fn trigger_nm_jit(eip_offset_in_page: i32) {
     dbg_log!("#nm in jit mode");
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
-    *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
+    *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page as u64;
     jit_exit_reason = JitExitReason::CpuException {
         code: CPU_EXCEPTION_NM,
         error_code: None,
@@ -2337,7 +3158,7 @@ pub unsafe fn trigger_nm_jit(eip_offset_in_page: i32) {
 pub unsafe fn trigger_gp_jit(code: i32, eip_offset_in_page: i32) {
     dbg_log!("#gp in jit mode");
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
-    *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
+    *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page as u64;
     jit_exit_reason = JitExitReason::CpuException {
         code: CPU_EXCEPTION_GP,
         error_code: Some(code),
@@ -2363,6 +3184,16 @@ pub unsafe fn exit_jit() {
     call_interrupt_vector(code, false, error_code);
 }
 
+// Set to the vector number while an exception/interrupt is being delivered
+// (-1 otherwise). A page fault during delivery of a #PF is promoted to #DF
+// (fault-class + fault-class), while a fault during #DF delivery shuts the
+// machine down (triple fault). A page fault during delivery of a benign
+// exception (e.g. #DE mid-delivery with a not-present stack page) is NOT
+// escalated: the PF is delivered normally and the source instruction
+// re-executes after the handler's iret, restarting the outer delivery.
+pub static mut in_interrupt_delivery: i32 = -1;
+pub static mut delivering_double_fault: bool = false;
+
 /// Pagefault handling with the jit works as follows:
 /// - If the slow path is taken, it calls safe_{read,write}*_jit
 /// - safe_{read,write}*_jit call translate_address_{read,write}_jit
@@ -2375,26 +3206,47 @@ pub unsafe fn exit_jit() {
 ///   and finally calls exit_jit, which does the interrupt
 ///
 /// Non-jit resets the instruction pointer and does the PF interrupt directly
-pub unsafe fn trigger_pagefault(addr: i32, present: bool, write: bool, user: bool, jit: bool) {
+pub unsafe fn trigger_pagefault(addr: u64, present: bool, write: bool, user: bool, jit: bool) {
+    trigger_pagefault_extended(addr, write, user, false, present, false, jit)
+}
+
+/// Page fault with full control over the error-code bits. `fetch` is the I/D
+/// bit (instruction fetch), `reserved` is the RSVD bit (page fault caused by a
+/// reserved bit in a present paging-structure entry). Note that P=1 is always
+/// implied for these (a present entry caused the fault).
+pub unsafe fn trigger_pagefault_extended(
+    addr: u64,
+    write: bool,
+    user: bool,
+    fetch: bool,
+    present: bool,
+    reserved: bool,
+    jit: bool,
+) {
     if config::LOG_PAGE_FAULTS {
         dbg_log!(
-            "page fault{} w={} u={} p={} eip={:x} cr2={:x}",
+            "page fault{} w={} u={} p={} r={} i={} eip={:x} cr2={:x}",
             if jit { "jit" } else { "" },
             write as i32,
             user as i32,
             present as i32,
+            reserved as i32,
+            fetch as i32,
             *previous_ip,
             addr
         );
         dbg_trace();
     }
     profiler::stat_increment(stat::PAGE_FAULT);
-    *cr.offset(2) = addr;
+    *cr.offset(2) = addr as u32 as i32;
+    *cr2_64 = addr;
     // invalidate tlb entry
-    let page = ((addr as u32) >> 12) as i32;
-    clear_tlb_code(page);
-    tlb_data[page as usize] = 0;
-    let error_code = (user as i32) << 2 | (write as i32) << 1 | present as i32;
+    tlb_invalidate_page(addr);
+    let error_code = (user as i32) << 2
+        | (write as i32) << 1
+        | present as i32
+        | (reserved as i32) << 3
+        | (fetch as i32) << 4;
     if jit {
         jit_exit_reason = JitExitReason::CpuException {
             code: CPU_EXCEPTION_PF,
@@ -2403,22 +3255,42 @@ pub unsafe fn trigger_pagefault(addr: i32, present: bool, write: bool, user: boo
     }
     else {
         *instruction_pointer = *previous_ip;
+        if delivering_double_fault {
+            // a fault while delivering #DF: triple fault, shut down
+            panic!("Triple fault: page fault during #DF delivery, cr2={:x}", addr);
+        }
+        if in_interrupt_delivery == CPU_EXCEPTION_PF {
+            // a page fault while delivering a page fault escalates to #DF
+            // (fault-class + fault-class); page faults nest at most one level
+            // in real hardware
+            dbg_log!("#DF: page fault during #PF delivery, cr2={:x}", addr);
+            delivering_double_fault = true;
+            in_interrupt_delivery = -1;
+            call_interrupt_vector(CPU_EXCEPTION_DF, false, Some(0));
+            delivering_double_fault = false;
+            return;
+        }
+        // note: a page fault during delivery of a benign exception (#DE, ...)
+        // is not escalated — the PF is delivered normally and the outer
+        // delivery restarts when the handler's iret re-runs the source
         call_interrupt_vector(CPU_EXCEPTION_PF, false, Some(error_code));
     }
 }
 
 pub fn tlb_set_has_code(physical_page: Page, has_code: bool) {
     for i in 0..unsafe { valid_tlb_entries_count } {
-        let page = unsafe { valid_tlb_entries[i as usize] };
-        let entry = unsafe { tlb_data[page as usize] };
+        let page = unsafe { valid_tlb_entries[i as usize] } as u64;
+        let entry = unsafe { tlb_pick_entry(page << 12) };
         if 0 != entry {
             let tlb_physical_page = Page::of_u32(
-                (entry as u32 >> 12 ^ page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
+                ((entry >> 12 ^ page) as u32).wrapping_sub(unsafe { memory::mem8 } as u32 >> 12),
             );
             if physical_page == tlb_physical_page {
                 unsafe {
-                    tlb_data[page as usize] =
-                        if has_code { entry | TLB_HAS_CODE } else { entry & !TLB_HAS_CODE }
+                    tlb_put_entry(
+                        page << 12,
+                        if has_code { entry | TLB_HAS_CODE as u64 } else { entry & !(TLB_HAS_CODE as u64) },
+                    )
                 }
                 if !has_code {
                     clear_tlb_code(page);
@@ -2432,16 +3304,18 @@ pub fn tlb_set_has_code(physical_page: Page, has_code: bool) {
 pub fn tlb_set_has_code_multiple(physical_pages: &HashSet<Page>, has_code: bool) {
     let physical_pages: Vec<Page> = physical_pages.into_iter().copied().collect();
     for i in 0..unsafe { valid_tlb_entries_count } {
-        let page = unsafe { valid_tlb_entries[i as usize] };
-        let entry = unsafe { tlb_data[page as usize] };
+        let page = unsafe { valid_tlb_entries[i as usize] } as u64;
+        let entry = unsafe { tlb_pick_entry(page << 12) };
         if 0 != entry {
             let tlb_physical_page = Page::of_u32(
-                (entry as u32 >> 12 ^ page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
+                ((entry >> 12 ^ page) as u32).wrapping_sub(unsafe { memory::mem8 } as u32 >> 12),
             );
             if physical_pages.contains(&tlb_physical_page) {
                 unsafe {
-                    tlb_data[page as usize] =
-                        if has_code { entry | TLB_HAS_CODE } else { entry & !TLB_HAS_CODE }
+                    tlb_put_entry(
+                        page << 12,
+                        if has_code { entry | TLB_HAS_CODE as u64 } else { entry & !(TLB_HAS_CODE as u64) },
+                    )
                 }
             }
         }
@@ -2456,18 +3330,18 @@ pub fn check_tlb_invariants() {
     }
 
     for i in 0..unsafe { valid_tlb_entries_count } {
-        let page = unsafe { valid_tlb_entries[i as usize] };
-        let entry = unsafe { tlb_data[page as usize] };
+        let page = unsafe { valid_tlb_entries[i as usize] } as u64;
+        let entry = unsafe { tlb_pick_entry(page << 12) };
 
-        if 0 == entry || 0 != entry & TLB_IN_MAPPED_RANGE {
+        if 0 == entry || 0 != entry as i32 & TLB_IN_MAPPED_RANGE {
             // there's no code in mapped memory
             continue;
         }
 
-        let target = (entry ^ page << 12) as u32 - unsafe { memory::mem8 } as u32;
+        let target = ((entry ^ page << 12) as u32).wrapping_sub(unsafe { memory::mem8 } as u32);
         dbg_assert!(!memory::in_mapped_range(target));
 
-        let entry_has_code = entry & TLB_HAS_CODE != 0;
+        let entry_has_code = entry as i32 & TLB_HAS_CODE != 0;
         let has_code = jit::jit_page_has_code(Page::page_of(target));
 
         // If some code has been created in a page, the corresponding tlb entries must be marked
@@ -2479,12 +3353,12 @@ pub const DISABLE_EIP_TRANSLATION_OPTIMISATION: bool = false;
 
 pub unsafe fn read_imm8() -> OrPageFault<i32> {
     let eip = *instruction_pointer;
-    if DISABLE_EIP_TRANSLATION_OPTIMISATION || 0 != eip & !0xFFF ^ *last_virt_eip {
-        *eip_phys = (translate_address_read(eip)? ^ eip as u32) as i32;
-        *last_virt_eip = eip & !0xFFF
+    if DISABLE_EIP_TRANSLATION_OPTIMISATION || 0 != eip & !0xFFF ^ *last_virt_eip64 as u64 {
+        *eip_phys64 = (translate_address_read(eip)? as u64) ^ eip;
+        *last_virt_eip64 = (eip & !0xFFF) as i64
     }
-    dbg_assert!(!memory::in_mapped_range((*eip_phys ^ eip) as u32));
-    let data8 = *memory::mem8.offset((*eip_phys ^ eip) as isize) as i32;
+    dbg_assert!(!memory::in_mapped_range((*eip_phys64 ^ eip) as u32));
+    let data8 = *memory::mem8.offset((*eip_phys64 ^ eip) as isize) as i32;
     *instruction_pointer = eip + 1;
     return Ok(data8);
 }
@@ -2493,15 +3367,15 @@ pub unsafe fn read_imm8s() -> OrPageFault<i32> { return Ok(read_imm8()? << 24 >>
 
 pub unsafe fn read_imm16() -> OrPageFault<i32> {
     // Two checks in one comparison:
-    // 1. Did the high 20 bits of eip change
+    // 1. Did the high bits of eip change
     // or 2. Are the low 12 bits of eip 0xFFF (and this read crosses a page boundary)
     if DISABLE_EIP_TRANSLATION_OPTIMISATION
-        || (*instruction_pointer ^ *last_virt_eip) as u32 > 0xFFE
+        || (*instruction_pointer ^ *last_virt_eip64 as u64) > 0xFFE
     {
         return Ok(read_imm8()? | read_imm8()? << 8);
     }
     else {
-        let data16 = memory::read16((*eip_phys ^ *instruction_pointer) as u32);
+        let data16 = memory::read16((*eip_phys64 ^ *instruction_pointer) as u32);
         *instruction_pointer = *instruction_pointer + 2;
         return Ok(data16);
     };
@@ -2510,40 +3384,55 @@ pub unsafe fn read_imm16() -> OrPageFault<i32> {
 pub unsafe fn read_imm32s() -> OrPageFault<i32> {
     // Analogue to the above comment
     if DISABLE_EIP_TRANSLATION_OPTIMISATION
-        || (*instruction_pointer ^ *last_virt_eip) as u32 > 0xFFC
+        || (*instruction_pointer ^ *last_virt_eip64 as u64) > 0xFFC
     {
         return Ok(read_imm16()? | read_imm16()? << 16);
     }
     else {
-        let data32 = memory::read32s((*eip_phys ^ *instruction_pointer) as u32);
+        let data32 = memory::read32s((*eip_phys64 ^ *instruction_pointer) as u32);
         *instruction_pointer = *instruction_pointer + 4;
         return Ok(data32);
     };
 }
 
+pub unsafe fn read_imm64s() -> OrPageFault<u64> {
+    let low = read_imm32s()? as u32 as u64;
+    let high = read_imm32s()? as u32 as u64;
+    Ok(low | high << 32)
+}
+
 pub unsafe fn is_osize_32() -> bool {
     dbg_assert!(!in_jit);
+    if *is_64 {
+        // in 64-bit mode the default operand size is 32 (0x66 -> 16,
+        // REX.W -> 64, handled at dispatch)
+        return *prefixes & prefix::PREFIX_MASK_OPSIZE == 0;
+    }
     return *is_32 != (*prefixes & prefix::PREFIX_MASK_OPSIZE == prefix::PREFIX_MASK_OPSIZE);
 }
 
 pub unsafe fn is_asize_32() -> bool {
     dbg_assert!(!in_jit);
+    if *is_64 {
+        // in 64-bit mode the default address size is 64 (0x67 -> 32)
+        return *prefixes & prefix::PREFIX_MASK_ADDRSIZE != 0;
+    }
     return *is_32 != (*prefixes & prefix::PREFIX_MASK_ADDRSIZE == prefix::PREFIX_MASK_ADDRSIZE);
 }
 
 pub unsafe fn lookup_segment_selector(
     selector: SegmentSelector,
-) -> OrPageFault<Result<(SegmentDescriptor, i32), SelectorNullOrInvalid>> {
+) -> OrPageFault<Result<(SegmentDescriptor, u64), SelectorNullOrInvalid>> {
     if selector.is_null() {
         return Ok(Err(SelectorNullOrInvalid::IsNull));
     }
 
     let (table_offset, table_limit) = if selector.is_gdt() {
-        (*gdtr_offset as u32, *gdtr_size as u32)
+        (*gdtr_offset64, *gdtr_size as u32)
     }
     else {
         (
-            *segment_offsets.offset(LDTR as isize) as u32,
+            *segment_offsets.offset(LDTR as isize) as u32 as u64,
             *segment_limits.offset(LDTR as isize) as u32,
         )
     };
@@ -2559,7 +3448,8 @@ pub unsafe fn lookup_segment_selector(
         return Ok(Err(SelectorNullOrInvalid::OutsideOfTableLimit));
     }
 
-    let descriptor_address = selector.descriptor_offset() as i32 + table_offset as i32;
+    let descriptor_address = (table_offset)
+        .wrapping_add(selector.descriptor_offset() as u32 as u64);
 
     let descriptor = SegmentDescriptor::of_u64(memory::read64s(translate_address_system_read(
         descriptor_address,
@@ -2596,18 +3486,20 @@ pub unsafe fn switch_seg(reg: i32, selector_raw: i32) -> bool {
         match return_on_pagefault!(lookup_segment_selector(selector), false) {
             Ok(desc) => desc,
             Err(SelectorNullOrInvalid::IsNull) => {
-                if reg == SS {
+                if reg == SS && !(*is_64 && *cpl != 3) {
+                    // a null SS is only permitted in 64-bit mode at cpl < 3
                     dbg_log!("#GP for loading 0 in SS sel={:x}", selector_raw);
+                    dbg_trace();
                     trigger_gp(0);
                     return false;
                 }
-                else {
-                    // es, ds, fs, gs
-                    *sreg.offset(reg as isize) = selector_raw as u16;
-                    *segment_is_null.offset(reg as isize) = true;
-                    update_state_flags();
-                    return true;
-                }
+                // In 64-bit mode a null selector in SS is usable (the SS base
+                // is ignored). The stack size attribute is not changed by a
+                // null load.
+                *sreg.offset(reg as isize) = selector_raw as u16;
+                *segment_is_null.offset(reg as isize) = true;
+                update_state_flags();
+                return true;
             },
             Err(SelectorNullOrInvalid::OutsideOfTableLimit) => {
                 dbg_log!(
@@ -2680,14 +3572,17 @@ pub unsafe fn switch_seg(reg: i32, selector_raw: i32) -> bool {
         descriptor = descriptor.set_accessed();
 
         memory::write8(
-            translate_address_system_write(descriptor_address + 5).unwrap(),
+            translate_address_system_write(descriptor_address.wrapping_add(5)).unwrap(),
             descriptor.access_byte() as i32,
         );
     }
 
     *segment_is_null.offset(reg as isize) = false;
     *segment_limits.offset(reg as isize) = descriptor.effective_limit();
-    *segment_offsets.offset(reg as isize) = descriptor.base();
+    // in 64-bit mode the base of cs/ss/ds/es is ignored (forced to 0); only
+    // fs and gs keep their base
+    *segment_offsets.offset(reg as isize) =
+        if *is_64 && reg != FS && reg != GS { 0 } else { descriptor.base() };
     *segment_access_bytes.offset(reg as isize) = descriptor.access_byte();
     *sreg.offset(reg as isize) = selector_raw as u16;
 
@@ -2741,11 +3636,20 @@ pub unsafe fn load_tr(selector: i32) {
     *tss_size_32 = descriptor.system_type() == 9;
     *segment_limits.offset(TR as isize) = descriptor.effective_limit();
     *segment_offsets.offset(TR as isize) = descriptor.base();
+    if *is_64 {
+        // A 64-bit TSS descriptor is 16 bytes: the high dword of the 64-bit
+        // base address sits in the second qword of the descriptor.
+        let descriptor_high_phys = return_on_pagefault!(translate_address_system_read(
+            descriptor_address.wrapping_add(8),
+        ));
+        let descriptor_high = memory::read64s(descriptor_high_phys) as u64;
+        *tss_base64 = (descriptor.base() as u32 as u64) | ((descriptor_high & 0xFFFF_FFFF) << 32);
+    }
     *sreg.offset(TR as isize) = selector.raw;
 
     // Mark task as busy
     memory::write8(
-        translate_address_system_write(descriptor_address + 5).unwrap(),
+        translate_address_system_write(descriptor_address.wrapping_add(5)).unwrap(),
         descriptor.set_busy().access_byte() as i32,
     );
 }
@@ -2842,6 +3746,7 @@ pub unsafe fn set_cr0(cr0: i32) {
     }
 
     if *cr.offset(4) & CR4_PAE != 0
+        && *efer & EFER_LME == 0
         && old_cr0 & (CR0_CD | CR0_NW | CR0_PG) != cr0 & (CR0_CD | CR0_NW | CR0_PG)
     {
         load_pdpte(*cr.offset(3))
@@ -2849,15 +3754,42 @@ pub unsafe fn set_cr0(cr0: i32) {
 
     *protected_mode = (*cr & CR0_PE) == CR0_PE;
     *segment_access_bytes.offset(CS as isize) = 0x80 | 0x10 | 0x08 | 0x02; // P dpl0 S E RW
+
+    let had_lma = *efer & EFER_LMA != 0;
+    update_efer_lma();
+    if had_lma && *efer & EFER_LMA == 0 && *is_64 {
+        // leaving long mode (paging disabled while executing 64-bit code)
+        dbg_log!("Leaving long mode");
+        *is_64 = false;
+        *is_32 = true;
+        update_state_flags();
+    }
+}
+
+// EFER.LMA follows EFER.LME && CR0.PG
+pub unsafe fn update_efer_lma() {
+    if *efer & EFER_LME != 0 && *cr & CR0_PG != 0 {
+        *efer |= EFER_LMA;
+    }
+    else {
+        *efer &= !EFER_LMA;
+    }
 }
 
 pub unsafe fn set_cr3(mut cr3: i32) {
-    if false {
-        dbg_log!("cr3 <- {:x}", cr3);
+    if cfg!(debug_assertions) && cr3 > 0x1000000 {
+        let pml4e0 = memory::read64s(cr3 as u32) as u64;
+        let pml4e2 = memory::read64s(cr3 as u32 + 16) as u64;
+        dbg_log!("cr3 <- {:x} pml4[0]={:x} pml4[2]={:x}", cr3, pml4e0, pml4e2);
     }
     if *cr.offset(4) & CR4_PAE != 0 {
         cr3 &= !0b1111;
-        load_pdpte(cr3);
+        if *efer & EFER_LME == 0 {
+            // 32-bit PAE: CR3 points to the PDPT and the PDPTEs are cached in
+            // the CPU. In long mode (LME set) CR3 points to the PML4 instead
+            // and there is no PDPTE cache.
+            load_pdpte(cr3);
+        }
     }
     else {
         cr3 &= !0b111111100111;
@@ -2872,26 +3804,32 @@ pub unsafe fn load_pdpte(cr3: i32) {
     for i in 0..4 {
         let mut pdpt_entry = memory::read64s(cr3 as u32 + 8 * i as u32) as u64;
         pdpt_entry &= !0b1110_0000_0000;
-        dbg_assert!(pdpt_entry & 0b11000 == 0, "TODO");
+        // bits 3-4 (PWT/PCD) are cache attributes we don't model
+        pdpt_entry &= !0b1_1000u64;
+        if pdpt_entry as i32 & PAGE_TABLE_PRESENT_MASK != 0 {
+            // bits 2:1 (rw/us) are ignored in PDPTEs; setting truly reserved
+            // bits should #gp, but tolerating them is harmless for bring-up
+            let reserved = pdpt_entry & 0b1_1110_0000_0110;
+            if reserved != 0 {
+                dbg_log!("reserved bits in pdpte: {:x}", reserved);
+            }
+        }
         dbg_assert!(
-            pdpt_entry as u64 & 0xFFFF_FFFF_0000_0000 == 0,
+            pdpt_entry & 0x7FFF_FFFF_0000_0000 == 0,
             "Unsupported: PDPT entry larger than 32 bits"
         );
-        if pdpt_entry as i32 & PAGE_TABLE_PRESENT_MASK != 0 {
-            dbg_assert!(
-                pdpt_entry & 0b1_1110_0110 == 0,
-                "TODO: #gp reserved bit in pdpte"
-            );
-        }
         *reg_pdpte.offset(i) = pdpt_entry;
     }
 }
 
-pub unsafe fn cpl_changed() { *last_virt_eip = -1 }
+pub unsafe fn cpl_changed() { *last_virt_eip64 = -1 }
 
-pub unsafe fn update_cs_size(new_size: bool) {
-    if *is_32 != new_size {
+pub unsafe fn update_cs_size(new_size: bool, new_is_64: bool) {
+    let new_is_64 = new_is_64 && *efer & EFER_LMA != 0;
+    dbg_assert!(!new_is_64 || !new_size, "64-bit code segment with D bit set");
+    if *is_32 != new_size || *is_64 != new_is_64 {
         *is_32 = new_size;
+        *is_64 = new_is_64;
     }
 }
 
@@ -2911,7 +3849,7 @@ pub unsafe fn test_privileges_for_io(port: i32, size: i32) -> bool {
             dbg_assert!(tsr_offset + 0x64 + 2 & 0xFFF < 0xFFF);
 
             let iomap_base = memory::read16(return_on_pagefault!(
-                translate_address_system_read(tsr_offset + 0x64 + 2),
+                translate_address_system_read((tsr_offset + 0x64 + 2) as u32 as u64),
                 false
             ));
             let high_port = port + size - 1;
@@ -2919,7 +3857,9 @@ pub unsafe fn test_privileges_for_io(port: i32, size: i32) -> bool {
             if tsr_size >= (iomap_base + (high_port >> 3)) as u32 {
                 let mask = ((1 << size) - 1) << (port & 7);
                 let addr = return_on_pagefault!(
-                    translate_address_system_read(tsr_offset + iomap_base + (port >> 3)),
+                    translate_address_system_read(
+                        (tsr_offset + iomap_base + (port >> 3)) as u32 as u64,
+                    ),
                     false
                 );
                 let port_info =
@@ -2970,7 +3910,12 @@ pub unsafe fn popa32() {
 pub fn get_state_flags() -> CachedStateFlags { unsafe { *state_flags } }
 
 #[no_mangle]
-pub fn get_seg_cs() -> i32 { unsafe { *segment_offsets.offset(CS as isize) } }
+pub fn get_seg_cs() -> i32 {
+    // in 64-bit mode the cs base is forced to 0
+    unsafe {
+        if *is_64 { 0 } else { *segment_offsets.offset(CS as isize) }
+    }
+}
 
 pub unsafe fn get_seg_ss() -> i32 { return *segment_offsets.offset(SS as isize); }
 
@@ -3001,26 +3946,78 @@ pub unsafe fn get_seg_prefix(default_segment: i32) -> OrPageFault<i32> {
     };
 }
 
-pub unsafe fn get_seg_prefix_ds(offset: i32) -> OrPageFault<i32> {
-    Ok(get_seg_prefix(DS)? + offset)
-}
-
-pub unsafe fn get_seg_prefix_ss(offset: i32) -> OrPageFault<i32> {
-    Ok(get_seg_prefix(SS)? + offset)
-}
-
-pub unsafe fn modrm_resolve(modrm_byte: i32) -> OrPageFault<i32> {
-    if is_asize_32() {
-        resolve_modrm32(modrm_byte)
+/// The segment base as a full 64-bit linear address part. In long mode the
+/// FS/GS bases come from their 64-bit MSRs; all other bases are forced to 0 in
+/// 64-bit mode (and every base fits in 32 bits in compatibility mode).
+pub unsafe fn get_seg64(segment: i32) -> u64 {
+    if *is_64 {
+        match segment {
+            FS => *fs_base,
+            GS => *gs_base,
+            _ => 0,
+        }
     }
     else {
-        resolve_modrm16(modrm_byte)
+        *segment_offsets.offset(segment as isize) as u32 as u64
+    }
+}
+
+pub unsafe fn get_seg_prefix64(default_segment: i32) -> OrPageFault<u64> {
+    dbg_assert!(!in_jit);
+    let prefix = *prefixes & prefix::PREFIX_MASK_SEGMENT;
+    if 0 != prefix {
+        if prefix == prefix::SEG_PREFIX_ZERO {
+            return Ok(0);
+        }
+        else {
+            return Ok(get_seg64(prefix as i32 - 1));
+        }
+    }
+    else {
+        return Ok(get_seg64(default_segment));
+    };
+}
+
+pub unsafe fn get_seg_prefix_ds(offset: u64) -> OrPageFault<u64> {
+    Ok(get_seg_prefix64(DS)?.wrapping_add(offset))
+}
+
+pub unsafe fn get_seg_prefix_ss(offset: u64) -> OrPageFault<u64> {
+    Ok(get_seg_prefix64(SS)?.wrapping_add(offset))
+}
+
+// imm_len: number of immediate bytes following modrm/sib/disp, needed for
+// RIP-relative addressing in 64-bit mode (ignored in 16/32-bit modes)
+pub unsafe fn modrm_resolve(modrm_byte: i32, imm_len: i32) -> OrPageFault<u64> {
+    if *is_64 {
+        if *prefixes & prefix::PREFIX_MASK_ADDRSIZE != 0 {
+            // 0x67: 32-bit addressing in 64-bit mode
+            // (note: REX.B/X register extension not applied here)
+            Ok(resolve_modrm32(modrm_byte)? as u32 as u64)
+        }
+        else {
+            resolve_modrm64(modrm_byte, imm_len)
+        }
+    }
+    else if is_asize_32() {
+        Ok(resolve_modrm32(modrm_byte)? as u32 as u64)
+    }
+    else {
+        Ok(resolve_modrm16(modrm_byte)? as u32 as u64)
     }
 }
 
 pub unsafe fn run_instruction(opcode: i32) { gen::interpreter::run(opcode as u32) }
 pub unsafe fn run_instruction0f_16(opcode: i32) { gen::interpreter0f::run(opcode as u32) }
-pub unsafe fn run_instruction0f_32(opcode: i32) { gen::interpreter0f::run(opcode as u32 | 0x100) }
+pub unsafe fn run_instruction0f_32(opcode: i32) {
+    if *is_64 && gen::interpreter0f::is_default_64_operand_size(opcode as u32) {
+        // default-64-bit 0F instructions (push/pop fs/gs) in long mode
+        gen::interpreter0f::run(opcode as u32 | 0x200)
+    }
+    else {
+        gen::interpreter0f::run(opcode as u32 | 0x100)
+    }
+}
 
 pub unsafe fn cycle_internal() {
     profiler::stat_increment(stat::CYCLE_INTERNAL);
@@ -3028,42 +4025,44 @@ pub unsafe fn cycle_internal() {
     let initial_eip = *instruction_pointer;
     let initial_state_flags = *state_flags;
 
-    match tlb_code[(initial_eip as u32 >> 12) as usize] {
-        None => {},
-        Some(c) => {
-            let c = c.as_ref();
+    {
+        match tlb_code_get(canonicalize_address(initial_eip) >> 12) {
+            None => {},
+            Some(c) => {
+                let c = c.as_ref();
 
-            if initial_state_flags == c.state_flags {
-                let state = c.state_table[initial_eip as usize & 0xFFF];
-                if state != u16::MAX {
-                    jit_entry = Some((c.wasm_table_index.to_u16(), state));
-                }
-                else {
-                    profiler::stat_increment(if is_near_end_of_page(initial_eip as u32) {
-                        stat::RUN_INTERPRETED_NEAR_END_OF_PAGE
+                if initial_state_flags == c.state_flags {
+                    let state = c.state_table[initial_eip as usize & 0xFFF];
+                    if state != u16::MAX {
+                        jit_entry = Some((c.wasm_table_index.to_u16(), state));
                     }
                     else {
-                        stat::RUN_INTERPRETED_PAGE_HAS_CODE
-                    })
+                        profiler::stat_increment(if is_near_end_of_page(initial_eip as u32) {
+                            stat::RUN_INTERPRETED_NEAR_END_OF_PAGE
+                        }
+                        else {
+                            stat::RUN_INTERPRETED_PAGE_HAS_CODE
+                        })
+                    }
                 }
-            }
-            else {
-                profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE);
-                let s = *state_flags;
-                if c.state_flags.cpl3() != s.cpl3() {
-                    profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_CPL3);
+                else {
+                    profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE);
+                    let s = *state_flags;
+                    if c.state_flags.cpl3() != s.cpl3() {
+                        profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_CPL3);
+                    }
+                    if c.state_flags.has_flat_segmentation() != s.has_flat_segmentation() {
+                        profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_FLAT);
+                    }
+                    if c.state_flags.is_32() != s.is_32() {
+                        profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_IS32);
+                    }
+                    if c.state_flags.ssize_32() != s.ssize_32() {
+                        profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_SS32);
+                    }
                 }
-                if c.state_flags.has_flat_segmentation() != s.has_flat_segmentation() {
-                    profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_FLAT);
-                }
-                if c.state_flags.is_32() != s.is_32() {
-                    profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_IS32);
-                }
-                if c.state_flags.ssize_32() != s.ssize_32() {
-                    profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE_SS32);
-                }
-            }
-        },
+            },
+        }
     }
 
     if let Some((wasm_table_index, initial_state)) = jit_entry {
@@ -3121,7 +4120,7 @@ pub unsafe fn cycle_internal() {
         if is_near_end_of_page(*instruction_pointer as u32) {
             profiler::stat_increment(stat::RUN_FROM_CACHE_EXIT_NEAR_END_OF_PAGE);
         }
-        else if Page::page_of(initial_eip as u32) == Page::page_of(*instruction_pointer as u32) {
+        else if (initial_eip ^ *instruction_pointer) & !0xFFF == 0 {
             profiler::stat_increment(stat::RUN_FROM_CACHE_EXIT_SAME_PAGE);
         }
         else {
@@ -3132,18 +4131,20 @@ pub unsafe fn cycle_internal() {
         *previous_ip = initial_eip;
         let phys_addr = return_on_pagefault!(get_phys_eip());
 
-        match tlb_code[(initial_eip as u32 >> 12) as usize] {
-            None => {},
-            Some(c) => {
-                let c = c.as_ref();
+        {
+            match tlb_code_get(canonicalize_address(initial_eip) >> 12) {
+                None => {},
+                Some(c) => {
+                    let c = c.as_ref();
 
-                if initial_state_flags == c.state_flags
-                    && c.state_table[initial_eip as usize & 0xFFF] != u16::MAX
-                {
-                    profiler::stat_increment(stat::RUN_INTERPRETED_PAGE_HAS_ENTRY_AFTER_PAGE_WALK);
-                    return;
-                }
-            },
+                    if initial_state_flags == c.state_flags
+                        && c.state_table[initial_eip as usize & 0xFFF] != u16::MAX
+                    {
+                        profiler::stat_increment(stat::RUN_INTERPRETED_PAGE_HAS_ENTRY_AFTER_PAGE_WALK);
+                        return;
+                    }
+                },
+            }
         }
 
         #[cfg(feature = "profiler")]
@@ -3177,13 +4178,41 @@ pub unsafe fn cycle_internal() {
 
 pub unsafe fn get_phys_eip() -> OrPageFault<u32> {
     let eip = *instruction_pointer;
-    if 0 != eip & !0xFFF ^ *last_virt_eip {
-        *eip_phys = (translate_address_read(eip)? ^ eip as u32) as i32;
-        *last_virt_eip = eip & !0xFFF
+    if 0 != eip & !0xFFF ^ *last_virt_eip64 as u64 {
+        *eip_phys64 = (translate_address_read_code(eip)? as u64) ^ eip;
+        *last_virt_eip64 = (eip & !0xFFF) as i64
     }
-    let phys_addr = (*eip_phys ^ eip) as u32;
+    let phys_addr = (*eip_phys64 ^ eip) as u32;
     dbg_assert!(!memory::in_mapped_range(phys_addr));
     return Ok(phys_addr);
+}
+
+/// Like translate_address_read, but for instruction fetches: additionally
+/// faults (with the I/D bit set in the error code) when the page is not
+/// executable (NX bit, long mode) or when a supervisor fetches from a user
+/// page with CR4.SMEP set, and sets I/D on fetch page faults in general when
+/// EFER.NXE or CR4.SMEP is enabled.
+pub fn translate_address_read_code(address: u64) -> OrPageFault<u32> {
+    unsafe {
+        let user = *cpl == 3;
+        let mut entry = tlb_pick_entry(address) as i32;
+        if entry & (TLB_VALID | if user { TLB_NO_USER } else { 0 }) != TLB_VALID {
+            entry = do_page_walk(address, false, user, false, true, true)? as i32;
+        }
+        let phys = (((entry as u64) & !0xFFF) ^ address) as u32 - memory::mem8 as u32;
+        let check_nx = *efer & EFER_NXE != 0 && *efer & EFER_LMA != 0;
+        let check_smep = *cr.offset(0) & CR0_PG != 0 && *cr.offset(4) & CR4_SMEP != 0 && *cpl != 3;
+        if check_nx && entry & (TLB_VALID | TLB_NOT_EXECUTABLE) == TLB_VALID | TLB_NOT_EXECUTABLE {
+            trigger_pagefault_nx(address);
+            return Err(());
+        }
+        if check_smep && entry & (TLB_VALID | TLB_NO_USER) == TLB_VALID {
+            // SMEP: supervisor-mode instruction fetch from a user page
+            trigger_pagefault_extended(address, false, false, true, true, false, false);
+            return Err(());
+        }
+        Ok(phys)
+    }
 }
 
 unsafe fn jit_run_interpreted(mut phys_addr: u32) {
@@ -3208,15 +4237,32 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32) {
         let opcode = *memory::mem8.offset(phys_addr as isize) as i32;
         *instruction_pointer += 1;
         dbg_assert!(*prefixes == 0);
-        run_instruction(opcode | (*is_32 as i32) << 8);
+        if *is_64 && opcode & 0xF0 == 0x40 {
+            // REX prefix
+            *prefixes =
+                prefix::PREFIX_REX_PRESENT | ((opcode as u16 & 0xF) << 8);
+            run_prefix_instruction();
+            *prefixes = 0;
+        }
+        else if *is_64 {
+            // in 64-bit mode the default operand size tier is 32 bit
+            if gen::interpreter::is_default_64_operand_size(opcode as u32) {
+                run_instruction(opcode | 0x200);
+            }
+            else {
+                run_instruction(opcode | 0x100);
+            }
+        }
+        else {
+            run_instruction(opcode | (*is_32 as i32) << 8);
+        }
         dbg_assert!(*prefixes == 0);
 
         if jit_block_boundary
-            || Page::page_of(start_eip as u32) != Page::page_of(*instruction_pointer as u32)
+            || (start_eip ^ *instruction_pointer) & !0xFFF != 0
                 // Limit the number of iterations, as jumps within the same page are not counted as
                 // block boundaries for the interpreter, but only on the next backwards jump
-            || (i >= INTERPRETER_ITERATION_LIMIT
-                && (start_eip as u32) >= (*instruction_pointer as u32))
+            || (i >= INTERPRETER_ITERATION_LIMIT && start_eip >= *instruction_pointer)
         {
             break;
         }
@@ -3232,6 +4278,30 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32) {
     *instruction_counter += i;
 }
 
+/// Execute one instruction with the same dispatch rules as the interpreter
+/// loop. Used for the interrupt shadow after STI: pending IRQs are serviced
+/// only after the instruction following STI completes.
+pub unsafe fn run_shadow_instruction() {
+    let opcode = return_on_pagefault!(read_imm8());
+    if *is_64 && opcode & 0xF0 == 0x40 {
+        // REX prefix
+        *prefixes = prefix::PREFIX_REX_PRESENT | ((opcode as u16 & 0xF) << 8);
+        run_prefix_instruction();
+        *prefixes = 0;
+    }
+    else if *is_64 {
+        if gen::interpreter::is_default_64_operand_size(opcode as u32) {
+            run_instruction(opcode | 0x200);
+        }
+        else {
+            run_instruction(opcode | 0x100);
+        }
+    }
+    else {
+        run_instruction(opcode | (*is_32 as i32) << 8);
+    }
+}
+
 #[no_mangle]
 pub fn update_state_flags() {
     unsafe {
@@ -3239,7 +4309,8 @@ pub fn update_state_flags() {
             (*is_32 as u32) << 0
                 | (*stack_size_32 as u32) << 1
                 | ((*cpl == 3) as u32) << 2
-                | (has_flat_segmentation() as u32) << 3,
+                | (has_flat_segmentation() as u32) << 3
+                | (*is_64 as u32) << 4,
         )
     }
 }
@@ -3254,12 +4325,35 @@ pub unsafe fn has_flat_segmentation() -> bool {
 }
 
 pub unsafe fn run_prefix_instruction() {
-    run_instruction(return_on_pagefault!(read_imm8()) | (is_osize_32() as i32) << 8);
+    let opcode = return_on_pagefault!(read_imm8());
+    if *is_64 && opcode & 0xF0 == 0x40 {
+        // REX prefix (0x40-0x4F in 64-bit mode); only the last REX before the
+        // opcode takes effect, a legacy prefix after a REX annuls it
+        *prefixes = *prefixes & !prefix::PREFIX_MASK_REX
+            | prefix::PREFIX_REX_PRESENT
+            | ((opcode as u16 & 0xF) << 8);
+        run_prefix_instruction();
+        *prefixes = 0;
+        return;
+    }
+    if *prefixes & prefix::PREFIX_REX_W != 0
+        || *is_64
+            && is_osize_32()
+            && gen::interpreter::is_default_64_operand_size(opcode as u32)
+    {
+        // REX.W (overrides the 0x66 prefix) or a default-64-bit instruction
+        // (push/pop/call/ret/... in long mode)
+        run_instruction(opcode | 0x200);
+    }
+    else {
+        run_instruction(opcode | (is_osize_32() as i32) << 8);
+    }
 }
 
 pub unsafe fn segment_prefix_op(seg: i32) {
     dbg_assert!(seg <= 5 && seg >= 0);
-    *prefixes = *prefixes & !prefix::PREFIX_MASK_SEGMENT | (seg as u8 + 1);
+    // a legacy prefix after a REX prefix annuls the REX prefix
+    *prefixes = *prefixes & !(prefix::PREFIX_MASK_SEGMENT | prefix::PREFIX_MASK_REX) | (seg as u16 + 1);
     run_prefix_instruction();
     *prefixes = 0
 }
@@ -3327,7 +4421,7 @@ pub unsafe fn trigger_de() {
 
 #[inline(never)]
 pub unsafe fn trigger_ud() {
-    dbg_log!("#ud");
+    dbg_log!("#ud at {:x}", *previous_ip);
     dbg_trace();
     *instruction_pointer = *previous_ip;
     if DEBUG {
@@ -3353,7 +4447,7 @@ pub unsafe fn trigger_nm() {
 
 #[inline(never)]
 pub unsafe fn trigger_gp(code: i32) {
-    dbg_log!("#gp");
+    dbg_log!("#gp code={:x} at ip={:x}", code, *previous_ip);
     *instruction_pointer = *previous_ip;
     if DEBUG {
         if js::cpu_exception_hook(CPU_EXCEPTION_GP) {
@@ -3425,11 +4519,11 @@ pub unsafe fn virt_boundary_write32(low: u32, high: u32, value: i32) {
     memory::write8(high as u32, value >> 24);
 }
 
-pub unsafe fn safe_read8(addr: i32) -> OrPageFault<i32> {
+pub unsafe fn safe_read8(addr: u64) -> OrPageFault<i32> {
     Ok(memory::read8(translate_address_read(addr)?))
 }
 
-pub unsafe fn safe_read16(addr: i32) -> OrPageFault<i32> {
+pub unsafe fn safe_read16(addr: u64) -> OrPageFault<i32> {
     if addr & 0xFFF == 0xFFF {
         Ok(safe_read8(addr)? | safe_read8(addr + 1)? << 8)
     }
@@ -3438,7 +4532,7 @@ pub unsafe fn safe_read16(addr: i32) -> OrPageFault<i32> {
     }
 }
 
-pub unsafe fn safe_read32s(addr: i32) -> OrPageFault<i32> {
+pub unsafe fn safe_read32s(addr: u64) -> OrPageFault<i32> {
     if addr & 0xFFF >= 0xFFD {
         Ok(safe_read16(addr)? | safe_read16(addr + 2)? << 16)
     }
@@ -3447,11 +4541,11 @@ pub unsafe fn safe_read32s(addr: i32) -> OrPageFault<i32> {
     }
 }
 
-pub unsafe fn safe_read_f32(addr: i32) -> OrPageFault<f32> {
+pub unsafe fn safe_read_f32(addr: u64) -> OrPageFault<f32> {
     Ok(f32::from_bits(i32::cast_unsigned(safe_read32s(addr)?)))
 }
 
-pub unsafe fn safe_read64s(addr: i32) -> OrPageFault<u64> {
+pub unsafe fn safe_read64s(addr: u64) -> OrPageFault<u64> {
     if addr & 0xFFF > 0x1000 - 8 {
         Ok(safe_read32s(addr)? as u32 as u64 | (safe_read32s(addr + 4)? as u32 as u64) << 32)
     }
@@ -3460,7 +4554,7 @@ pub unsafe fn safe_read64s(addr: i32) -> OrPageFault<u64> {
     }
 }
 
-pub unsafe fn safe_read128s(addr: i32) -> OrPageFault<reg128> {
+pub unsafe fn safe_read128s(addr: u64) -> OrPageFault<reg128> {
     if addr & 0xFFF > 0x1000 - 16 {
         Ok(reg128 {
             u64: [safe_read64s(addr)?, safe_read64s(addr + 8)?],
@@ -3554,12 +4648,30 @@ pub unsafe fn safe_read_slow_jit(
     is_write: bool,
     eip_offset_in_page_and_wasm_table_index: i32,
 ) -> i32 {
+    safe_read_slow_jit_impl(
+        addr as u32 as u64,
+        bitsize,
+        is_write,
+        eip_offset_in_page_and_wasm_table_index,
+    )
+}
+
+/// Slow path of jitted memory reads (and the read part of read-modify-write accesses). Returns
+/// (pointer ^ address) & !0xFFF, where pointer is where the fast path reads the value from, or
+/// 1 for an exception (which is delivered by exit_jit). Only the low 32 bits of the address
+/// matter for the returned value.
+pub unsafe fn safe_read_slow_jit_impl(
+    addr: u64,
+    bitsize: i32,
+    is_write: bool,
+    eip_offset_in_page_and_wasm_table_index: i32,
+) -> i32 {
     let wasm_table_index = (eip_offset_in_page_and_wasm_table_index >> 16) as u16;
     let eip_offset_in_page = eip_offset_in_page_and_wasm_table_index & 0xFFFF;
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
     dbg_assert!(u32::from(wasm_table_index) < jit::WASM_TABLE_SIZE);
 
-    let crosses_page = (addr & 0xFFF) + bitsize / 8 > 0x1000;
+    let crosses_page = (addr & 0xFFF) as i32 + bitsize / 8 > 0x1000;
     let addr_low = match if is_write {
         translate_address_write_jit(addr, wasm_table_index)
     }
@@ -3567,13 +4679,13 @@ pub unsafe fn safe_read_slow_jit(
         translate_address_read_jit(addr)
     } {
         Err(()) => {
-            *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
+            *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page as u64;
             return 1;
         },
         Ok(addr) => addr,
     };
     if crosses_page {
-        let boundary_addr = (addr | 0xFFF) + 1;
+        let boundary_addr = (addr | 0xFFF).wrapping_add(1);
         let addr_high = match if is_write {
             translate_address_write_jit(boundary_addr, wasm_table_index)
         }
@@ -3581,7 +4693,7 @@ pub unsafe fn safe_read_slow_jit(
             translate_address_read_jit(boundary_addr)
         } {
             Err(()) => {
-                *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
+                *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page as u64;
                 return 1;
             },
             Ok(addr) => addr,
@@ -3595,11 +4707,11 @@ pub unsafe fn safe_read_slow_jit(
         for s in addr_low..((addr_low | 0xFFF) + 1) {
             *(scratch as *mut u8).offset((s & 0xFFF) as isize) = memory::read8(s) as u8
         }
-        for s in addr_high..(addr_high + (addr + bitsize / 8 & 0xFFF) as u32) {
+        for s in addr_high..(addr_high + ((addr as i32 + bitsize / 8) & 0xFFF) as u32) {
             *(scratch as *mut u8).offset((0x1000 | s & 0xFFF) as isize) = memory::read8(s) as u8
         }
 
-        ((scratch as i32) ^ addr) & !0xFFF
+        ((scratch as i32) ^ addr as i32) & !0xFFF
     }
     else if memory::in_mapped_range(addr_low) {
         let scratch = &raw mut jit_paging_scratch_buffer.0[0];
@@ -3630,10 +4742,10 @@ pub unsafe fn safe_read_slow_jit(
             },
         }
 
-        ((scratch as i32) ^ addr) & !0xFFF
+        ((scratch as i32) ^ addr as i32) & !0xFFF
     }
     else {
-        ((addr_low as i32 + memory::mem8 as i32) ^ addr) & !0xFFF
+        ((addr_low as i32 + memory::mem8 as i32) ^ addr as i32) & !0xFFF
     }
 }
 
@@ -3660,7 +4772,7 @@ pub unsafe fn safe_read128s_slow_jit(addr: i32, eip: i32) -> i32 {
 
 #[no_mangle]
 pub unsafe fn get_phys_eip_slow_jit(addr: i32) -> i32 {
-    match translate_address_read_jit(addr) {
+    match translate_address_read_jit(addr as u32 as u64) {
         Err(()) => 1,
         Ok(addr_low) => {
             dbg_assert!(!memory::in_mapped_range(addr_low as u32)); // same assumption as in read_imm8
@@ -3691,10 +4803,10 @@ pub unsafe fn readable_or_pagefault_jit(addr: i32, size: i32, eip_offset_in_page
     dbg_assert!(size > 0 && size < 0x1000);
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
     let crosses_page = (addr & 0xFFF) + size > 0x1000;
-    if translate_address_read_jit(addr).is_err()
-        || crosses_page && translate_address_read_jit((addr | 0xFFF) + 1).is_err()
+    if translate_address_read_jit(addr as u32 as u64).is_err()
+        || crosses_page && translate_address_read_jit(((addr | 0xFFF) + 1) as u32 as u64).is_err()
     {
-        *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
+        *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page as u64;
         return 1;
     }
     0
@@ -3707,23 +4819,41 @@ pub unsafe fn safe_write_slow_jit(
     value_high: u64,
     eip_offset_in_page_and_wasm_table_index: i32,
 ) -> i32 {
+    safe_write_slow_jit_impl(
+        addr as u32 as u64,
+        bitsize,
+        value_low,
+        value_high,
+        eip_offset_in_page_and_wasm_table_index,
+    )
+}
+
+/// Slow path of jitted memory writes, see safe_read_slow_jit_impl. Writes that cross a page or
+/// go to memory-mapped io are done here, the returned pointer then points to a scratch buffer.
+pub unsafe fn safe_write_slow_jit_impl(
+    addr: u64,
+    bitsize: i32,
+    value_low: u64,
+    value_high: u64,
+    eip_offset_in_page_and_wasm_table_index: i32,
+) -> i32 {
     let wasm_table_index = (eip_offset_in_page_and_wasm_table_index >> 16) as u16;
     let eip_offset_in_page = eip_offset_in_page_and_wasm_table_index & 0xFFFF;
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
     dbg_assert!(u32::from(wasm_table_index) < jit::WASM_TABLE_SIZE);
 
-    let crosses_page = (addr & 0xFFF) + bitsize / 8 > 0x1000;
+    let crosses_page = (addr & 0xFFF) as i32 + bitsize / 8 > 0x1000;
     let addr_low = match translate_address_write_jit(addr, wasm_table_index) {
         Err(()) => {
-            *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
+            *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page as u64;
             return 1;
         },
         Ok(x) => x,
     };
     if crosses_page {
-        let addr_high = match translate_address_write_jit((addr | 0xFFF) + 1, wasm_table_index) {
+        let addr_high = match translate_address_write_jit((addr | 0xFFF).wrapping_add(1), wasm_table_index) {
             Err(()) => {
-                *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
+                *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page as u64;
                 return 1;
             },
             Ok(x) => x,
@@ -3757,7 +4887,7 @@ pub unsafe fn safe_write_slow_jit(
 
         let scratch = &raw mut jit_paging_scratch_buffer.0 as u32;
         dbg_assert!(scratch & 0xFFF == 0);
-        ((scratch as i32) ^ addr) & !0xFFF
+        ((scratch as i32) ^ addr as i32) & !0xFFF
     }
     else if memory::in_mapped_range(addr_low) {
         match bitsize {
@@ -3773,11 +4903,61 @@ pub unsafe fn safe_write_slow_jit(
 
         let scratch = &raw mut jit_paging_scratch_buffer.0 as u32;
         dbg_assert!(scratch & 0xFFF == 0);
-        ((scratch as i32) ^ addr) & !0xFFF
+        ((scratch as i32) ^ addr as i32) & !0xFFF
     }
     else {
-        ((addr_low as i32 + memory::mem8 as i32) ^ addr) & !0xFFF
+        ((addr_low as i32 + memory::mem8 as i32) ^ addr as i32) & !0xFFF
     }
+}
+
+// 64-bit address variants of the slow paths, for the 64-bit jit
+#[no_mangle]
+pub unsafe fn safe_read8_slow_jit64(addr: u64, eip: i32) -> i32 {
+    safe_read_slow_jit_impl(addr, 8, false, eip)
+}
+#[no_mangle]
+pub unsafe fn safe_read16_slow_jit64(addr: u64, eip: i32) -> i32 {
+    safe_read_slow_jit_impl(addr, 16, false, eip)
+}
+#[no_mangle]
+pub unsafe fn safe_read32s_slow_jit64(addr: u64, eip: i32) -> i32 {
+    safe_read_slow_jit_impl(addr, 32, false, eip)
+}
+#[no_mangle]
+pub unsafe fn safe_read64s_slow_jit64(addr: u64, eip: i32) -> i32 {
+    safe_read_slow_jit_impl(addr, 64, false, eip)
+}
+#[no_mangle]
+pub unsafe fn safe_read_write8_slow_jit64(addr: u64, eip_and_wasm_table_index: i32) -> i32 {
+    safe_read_slow_jit_impl(addr, 8, true, eip_and_wasm_table_index)
+}
+#[no_mangle]
+pub unsafe fn safe_read_write16_slow_jit64(addr: u64, eip_and_wasm_table_index: i32) -> i32 {
+    safe_read_slow_jit_impl(addr, 16, true, eip_and_wasm_table_index)
+}
+#[no_mangle]
+pub unsafe fn safe_read_write32s_slow_jit64(addr: u64, eip_and_wasm_table_index: i32) -> i32 {
+    safe_read_slow_jit_impl(addr, 32, true, eip_and_wasm_table_index)
+}
+#[no_mangle]
+pub unsafe fn safe_read_write64_slow_jit64(addr: u64, eip_and_wasm_table_index: i32) -> i32 {
+    safe_read_slow_jit_impl(addr, 64, true, eip_and_wasm_table_index)
+}
+#[no_mangle]
+pub unsafe fn safe_write8_slow_jit64(addr: u64, value: i32, eip_and_wasm_table_index: i32) -> i32 {
+    safe_write_slow_jit_impl(addr, 8, value as u32 as u64, 0, eip_and_wasm_table_index)
+}
+#[no_mangle]
+pub unsafe fn safe_write16_slow_jit64(addr: u64, value: i32, eip_and_wasm_table_index: i32) -> i32 {
+    safe_write_slow_jit_impl(addr, 16, value as u32 as u64, 0, eip_and_wasm_table_index)
+}
+#[no_mangle]
+pub unsafe fn safe_write32_slow_jit64(addr: u64, value: i32, eip_and_wasm_table_index: i32) -> i32 {
+    safe_write_slow_jit_impl(addr, 32, value as u32 as u64, 0, eip_and_wasm_table_index)
+}
+#[no_mangle]
+pub unsafe fn safe_write64_slow_jit64(addr: u64, value: u64, eip_and_wasm_table_index: i32) -> i32 {
+    safe_write_slow_jit_impl(addr, 64, value, 0, eip_and_wasm_table_index)
 }
 
 #[no_mangle]
@@ -3818,17 +4998,17 @@ pub unsafe fn writable_or_pagefault_jit(
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
     dbg_assert!(u32::from(wasm_table_index) < jit::WASM_TABLE_SIZE);
     let crosses_page = (addr & 0xFFF) + size > 0x1000;
-    if translate_address_write_jit(addr, wasm_table_index).is_err()
+    if translate_address_write_jit(addr as u32 as u64, wasm_table_index).is_err()
         || crosses_page
-            && translate_address_write_jit((addr | 0xFFF) + 1, wasm_table_index).is_err()
+            && translate_address_write_jit(((addr | 0xFFF) + 1) as u32 as u64, wasm_table_index).is_err()
     {
-        *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
+        *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page as u64;
         return 1;
     }
     0
 }
 
-pub unsafe fn safe_write8(addr: i32, value: i32) -> OrPageFault<()> {
+pub unsafe fn safe_write8(addr: u64, value: i32) -> OrPageFault<()> {
     let (phys_addr, can_skip_dirty_page) = translate_address_write_and_can_skip_dirty(addr)?;
     if memory::in_mapped_range(phys_addr) {
         memory::mmap_write8(phys_addr, value);
@@ -3845,7 +5025,7 @@ pub unsafe fn safe_write8(addr: i32, value: i32) -> OrPageFault<()> {
     Ok(())
 }
 
-pub unsafe fn safe_write16(addr: i32, value: i32) -> OrPageFault<()> {
+pub unsafe fn safe_write16(addr: u64, value: i32) -> OrPageFault<()> {
     let (phys_addr, can_skip_dirty_page) = translate_address_write_and_can_skip_dirty(addr)?;
     dbg_assert!(value >= 0 && value < 0x10000);
     if addr & 0xFFF == 0xFFF {
@@ -3866,7 +5046,7 @@ pub unsafe fn safe_write16(addr: i32, value: i32) -> OrPageFault<()> {
     Ok(())
 }
 
-pub unsafe fn safe_write32(addr: i32, value: i32) -> OrPageFault<()> {
+pub unsafe fn safe_write32(addr: u64, value: i32) -> OrPageFault<()> {
     let (phys_addr, can_skip_dirty_page) = translate_address_write_and_can_skip_dirty(addr)?;
     if addr & 0xFFF > 0x1000 - 4 {
         virt_boundary_write32(
@@ -3890,7 +5070,7 @@ pub unsafe fn safe_write32(addr: i32, value: i32) -> OrPageFault<()> {
     Ok(())
 }
 
-pub unsafe fn safe_write64(addr: i32, value: u64) -> OrPageFault<()> {
+pub unsafe fn safe_write64(addr: u64, value: u64) -> OrPageFault<()> {
     if addr & 0xFFF > 0x1000 - 8 {
         writable_or_pagefault(addr, 8)?;
         safe_write32(addr, value as i32).unwrap();
@@ -3914,7 +5094,7 @@ pub unsafe fn safe_write64(addr: i32, value: u64) -> OrPageFault<()> {
     Ok(())
 }
 
-pub unsafe fn safe_write128(addr: i32, value: reg128) -> OrPageFault<()> {
+pub unsafe fn safe_write128(addr: u64, value: reg128) -> OrPageFault<()> {
     if addr & 0xFFF > 0x1000 - 16 {
         writable_or_pagefault(addr, 16)?;
         safe_write64(addr, value.u64[0]).unwrap();
@@ -3939,7 +5119,7 @@ pub unsafe fn safe_write128(addr: i32, value: reg128) -> OrPageFault<()> {
 }
 
 #[inline(always)]
-pub unsafe fn safe_read_write8(addr: i32, instruction: &dyn Fn(i32) -> i32) {
+pub unsafe fn safe_read_write8(addr: u64, instruction: &dyn Fn(i32) -> i32) {
     let (phys_addr, can_skip_dirty_page) =
         return_on_pagefault!(translate_address_write_and_can_skip_dirty(addr));
     let x = memory::read8(phys_addr);
@@ -3960,7 +5140,7 @@ pub unsafe fn safe_read_write8(addr: i32, instruction: &dyn Fn(i32) -> i32) {
 }
 
 #[inline(always)]
-pub unsafe fn safe_read_write16(addr: i32, instruction: &dyn Fn(i32) -> i32) {
+pub unsafe fn safe_read_write16(addr: u64, instruction: &dyn Fn(i32) -> i32) {
     let (phys_addr, can_skip_dirty_page) =
         return_on_pagefault!(translate_address_write_and_can_skip_dirty(addr));
     if phys_addr & 0xFFF == 0xFFF {
@@ -3988,7 +5168,7 @@ pub unsafe fn safe_read_write16(addr: i32, instruction: &dyn Fn(i32) -> i32) {
 }
 
 #[inline(always)]
-pub unsafe fn safe_read_write32(addr: i32, instruction: &dyn Fn(i32) -> i32) {
+pub unsafe fn safe_read_write32(addr: u64, instruction: &dyn Fn(i32) -> i32) {
     let (phys_addr, can_skip_dirty_page) =
         return_on_pagefault!(translate_address_write_and_can_skip_dirty(addr));
     if phys_addr & 0xFFF >= 0xFFD {
@@ -4015,78 +5195,167 @@ pub unsafe fn safe_read_write32(addr: i32, instruction: &dyn Fn(i32) -> i32) {
     }
 }
 
-fn get_reg8_index(index: i32) -> i32 { return index << 2 & 12 | index >> 2 & 1; }
+#[inline(always)]
+pub unsafe fn safe_read_write64(addr: u64, instruction: &dyn Fn(u64) -> u64) {
+    let (phys_addr, can_skip_dirty_page) =
+        return_on_pagefault!(translate_address_write_and_can_skip_dirty(addr));
+    if phys_addr & 0xFFF > 0x1000 - 8 {
+        // crosses a page boundary (cold)
+        let x = return_on_pagefault!(safe_read64s(addr));
+        let value = instruction(x);
+        return_on_pagefault!(safe_write64(addr, value));
+    }
+    else {
+        let x = memory::read64s(phys_addr) as u64;
+        let value = instruction(x);
+        if memory::in_mapped_range(phys_addr) {
+            memory::mmap_write64(phys_addr, value);
+        }
+        else {
+            if !can_skip_dirty_page {
+                jit::jit_dirty_page(Page::page_of(phys_addr));
+            }
+            else {
+                dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
+            }
+            memory::write64_no_mmap_or_dirty_check(phys_addr, value);
+        };
+    }
+}
+
+// REX extension bits of the current instruction's prefixes (64-bit mode only):
+// return 8 when the corresponding bit is set, 0 otherwise
+#[inline]
+pub unsafe fn rex_r() -> i32 { (*prefixes & prefix::PREFIX_REX_R) as i32 >> 7 }
+#[inline]
+pub unsafe fn rex_x() -> i32 { (*prefixes & prefix::PREFIX_REX_X) as i32 >> 6 }
+#[inline]
+pub unsafe fn rex_b() -> i32 { (*prefixes & prefix::PREFIX_REX_B) as i32 >> 5 }
+#[inline]
+pub unsafe fn rex_w() -> bool { *prefixes & prefix::PREFIX_REX_W != 0 }
+
+fn get_reg8_index(index: i32) -> i32 { return index << 3 & 24 | index >> 2 & 1; }
 
 pub unsafe fn read_reg8(index: i32) -> i32 {
-    dbg_assert!(index >= 0 && index < 8);
+    dbg_assert!(index >= 0 && index < 16);
+    if *prefixes & prefix::PREFIX_REX_PRESENT != 0 {
+        // with a REX prefix, indices 4-15 encode the low bytes of rsp-r15
+        // (ah/ch/dh/bh are not encodable)
+        return *reg8.offset((index << 3) as isize) as i32;
+    }
+    dbg_assert!(index < 8);
     return *reg8.offset(get_reg8_index(index) as isize) as i32;
 }
 
 pub unsafe fn write_reg8(index: i32, value: i32) {
-    dbg_assert!(index >= 0 && index < 8);
+    dbg_assert!(index >= 0 && index < 16);
+    if *prefixes & prefix::PREFIX_REX_PRESENT != 0 {
+        *reg8.offset((index << 3) as isize) = value as u8;
+        return;
+    }
+    dbg_assert!(index < 8);
     *reg8.offset(get_reg8_index(index) as isize) = value as u8;
 }
 
-fn get_reg16_index(index: i32) -> i32 { return index << 1; }
+fn get_reg16_index(index: i32) -> i32 { return index << 2; }
 
 pub unsafe fn read_reg16(index: i32) -> i32 {
-    dbg_assert!(index >= 0 && index < 8);
+    dbg_assert!(index >= 0 && index < 16);
     return *reg16.offset(get_reg16_index(index) as isize) as i32;
 }
 
 pub unsafe fn write_reg16(index: i32, value: i32) {
-    dbg_assert!(index >= 0 && index < 8);
+    dbg_assert!(index >= 0 && index < 16);
     *reg16.offset(get_reg16_index(index) as isize) = value as u16;
 }
 
+// 8-bit access to the legacy high byte registers (AH/CH/DH/BH) by
+// instructions that hardcode them (sahf, div8, ...). Unlike
+// read_reg8/write_reg8 these are NOT remapped by a REX prefix.
+pub unsafe fn read_reg8_legacy_high(index: i32) -> i32 {
+    dbg_assert!(index >= 4 && index < 8);
+    *reg8.offset(((index - 4) * 8 + 1) as isize) as i32
+}
+pub unsafe fn write_reg8_legacy_high(index: i32, value: i32) {
+    dbg_assert!(index >= 4 && index < 8);
+    *reg8.offset(((index - 4) * 8 + 1) as isize) = value as u8;
+}
+
 pub unsafe fn read_reg32(index: i32) -> i32 {
-    dbg_assert!(index >= 0 && index < 8);
-    *reg32.offset(index as isize)
+    dbg_assert!(index >= 0 && index < 16);
+    *reg32.offset((index << 1) as isize)
 }
 
 pub unsafe fn write_reg32(index: i32, value: i32) {
-    dbg_assert!(index >= 0 && index < 8);
-    *reg32.offset(index as isize) = value;
+    dbg_assert!(index >= 0 && index < 16);
+    // 32-bit writes zero-extend into the full 64-bit register
+    *reg64.offset(index as isize) = value as u32 as u64;
 }
 
-pub unsafe fn read_mmx32s(r: i32) -> i32 { (*fpu_st.offset(r as isize)).mantissa as i32 }
+pub unsafe fn read_reg64(index: i32) -> u64 {
+    dbg_assert!(index >= 0 && index < 16);
+    *reg64.offset(index as isize)
+}
 
-pub unsafe fn read_mmx64s(r: i32) -> u64 { (*fpu_st.offset(r as isize)).mantissa }
+pub unsafe fn write_reg64(index: i32, value: u64) {
+    dbg_assert!(index >= 0 && index < 16);
+    *reg64.offset(index as isize) = value;
+}
+
+// MMX register accessors: REX.R/REX.B do not extend MMX register fields, so
+// the index is masked to 3 bits (the generated modrm decode has REX folded in)
+pub unsafe fn read_mmx32s(r: i32) -> i32 { (*fpu_st.offset((r & 7) as isize)).mantissa as i32 }
+
+pub unsafe fn read_mmx64s(r: i32) -> u64 { (*fpu_st.offset((r & 7) as isize)).mantissa }
 
 pub unsafe fn write_mmx_reg64(r: i32, data: u64) {
+    let r = r & 7;
     *fpu_st.offset(r as isize) = softfloat::F80 {
         mantissa: data,
         sign_exponent: 0xFFFF,
     };
 }
 
-pub unsafe fn read_xmm_f32(r: i32) -> f32 { return (*reg_xmm.offset(r as isize)).f32[0]; }
+// xmm register accessor: xmm0-7 live at reg_xmm, xmm8-15 (64-bit mode, REX
+// extension) at reg_xmm_high
+#[inline]
+pub unsafe fn reg_xmm_ptr(r: i32) -> *mut reg128 {
+    dbg_assert!(r >= 0 && r < 16);
+    if r < 8 {
+        reg_xmm.offset(r as isize)
+    }
+    else {
+        reg_xmm_high.offset(r as isize - 8)
+    }
+}
 
-pub unsafe fn read_xmm32(r: i32) -> i32 { return (*reg_xmm.offset(r as isize)).u32[0] as i32; }
+pub unsafe fn read_xmm_f32(r: i32) -> f32 { return (*reg_xmm_ptr(r)).f32[0]; }
 
-pub unsafe fn read_xmm64s(r: i32) -> u64 { (*reg_xmm.offset(r as isize)).u64[0] }
+pub unsafe fn read_xmm32(r: i32) -> i32 { return (*reg_xmm_ptr(r)).u32[0] as i32; }
 
-pub unsafe fn read_xmm128s(r: i32) -> reg128 { return *reg_xmm.offset(r as isize); }
+pub unsafe fn read_xmm64s(r: i32) -> u64 { (*reg_xmm_ptr(r)).u64[0] }
 
-pub unsafe fn write_xmm_f32(r: i32, data: f32) { (*reg_xmm.offset(r as isize)).f32[0] = data; }
+pub unsafe fn read_xmm128s(r: i32) -> reg128 { return *reg_xmm_ptr(r); }
 
-pub unsafe fn write_xmm32(r: i32, data: i32) { (*reg_xmm.offset(r as isize)).i32[0] = data; }
+pub unsafe fn write_xmm_f32(r: i32, data: f32) { (*reg_xmm_ptr(r)).f32[0] = data; }
 
-pub unsafe fn write_xmm64(r: i32, data: u64) { (*reg_xmm.offset(r as isize)).u64[0] = data }
-pub unsafe fn write_xmm_f64(r: i32, data: f64) { (*reg_xmm.offset(r as isize)).f64[0] = data }
+pub unsafe fn write_xmm32(r: i32, data: i32) { (*reg_xmm_ptr(r)).i32[0] = data; }
+
+pub unsafe fn write_xmm64(r: i32, data: u64) { (*reg_xmm_ptr(r)).u64[0] = data }
+pub unsafe fn write_xmm_f64(r: i32, data: f64) { (*reg_xmm_ptr(r)).f64[0] = data }
 
 pub unsafe fn write_xmm128(r: i32, i0: i32, i1: i32, i2: i32, i3: i32) {
     let x = reg128 {
         u32: [i0 as u32, i1 as u32, i2 as u32, i3 as u32],
     };
-    *reg_xmm.offset(r as isize) = x;
+    *reg_xmm_ptr(r) = x;
 }
 
 pub unsafe fn write_xmm128_2(r: i32, i0: u64, i1: u64) {
-    *reg_xmm.offset(r as isize) = reg128 { u64: [i0, i1] };
+    *reg_xmm_ptr(r) = reg128 { u64: [i0, i1] };
 }
 
-pub unsafe fn write_xmm_reg128(r: i32, data: reg128) { *reg_xmm.offset(r as isize) = data; }
+pub unsafe fn write_xmm_reg128(r: i32, data: reg128) { *reg_xmm_ptr(r) = data; }
 
 /// Set the fpu tag word to valid and the top-of-stack to 0 on mmx instructions
 #[no_mangle]
@@ -4177,20 +5446,34 @@ pub unsafe fn task_switch_test_mmx_jit(eip_offset_in_page: i32) {
     }
 }
 
-pub unsafe fn read_moffs() -> OrPageFault<i32> {
-    // read 2 or 4 byte from ip, depending on address size attribute
-    if is_asize_32() {
-        read_imm32s()
+pub unsafe fn read_moffs() -> OrPageFault<u64> {
+    // In 64-bit mode the moffs immediate is 8 bytes (4 with 0x67); otherwise 2
+    // or 4 bytes, depending on the address size attribute
+    if *is_64 {
+        if is_asize_32() {
+            Ok(read_imm32s()? as u32 as u64)
+        }
+        else {
+            read_imm64s()
+        }
+    }
+    else if is_asize_32() {
+        Ok(read_imm32s()? as u32 as u64)
     }
     else {
-        read_imm16()
+        Ok(read_imm16()? as u32 as u64)
     }
 }
 
 #[no_mangle]
 pub unsafe fn get_real_eip() -> i32 {
     // Returns the 'real' instruction pointer, without segment offset
-    return *instruction_pointer - get_seg_cs();
+    return (*instruction_pointer).wrapping_sub(get_seg_cs() as u64) as u32 as i32;
+}
+
+pub unsafe fn get_real_eip64() -> u64 {
+    // Returns the 'real' instruction pointer, without segment offset
+    return (*instruction_pointer).wrapping_sub(get_seg_cs() as u64);
 }
 
 pub unsafe fn get_stack_reg() -> i32 {
@@ -4211,36 +5494,45 @@ pub unsafe fn set_stack_reg(value: i32) {
     };
 }
 
-pub unsafe fn get_reg_asize(reg: i32) -> i32 {
+pub unsafe fn get_reg_asize(reg: i32) -> u64 {
     dbg_assert!(reg == ECX || reg == ESI || reg == EDI);
+    if *is_64 && *prefixes & prefix::PREFIX_MASK_ADDRSIZE == 0 {
+        // 64-bit address size in long mode
+        return read_reg64(reg);
+    }
     let r = read_reg32(reg);
-    if is_asize_32() {
-        return r;
-    }
-    else {
-        return r & 0xFFFF;
-    };
+    (if is_asize_32() { r } else { r & 0xFFFF }) as u32 as u64
 }
 
-pub unsafe fn set_reg_asize(is_asize_32: bool, reg: i32, value: i32) {
+pub unsafe fn set_reg_asize(is_asize_32: bool, reg: i32, value: u64) {
     dbg_assert!(reg == ECX || reg == ESI || reg == EDI);
-    if is_asize_32 {
-        write_reg32(reg, value)
+    if *is_64 && !is_asize_32 {
+        // default 64-bit address size in long mode
+        write_reg64(reg, value)
+    }
+    else if is_asize_32 {
+        write_reg32(reg, value as u32 as i32)
     }
     else {
-        write_reg16(reg, value)
+        write_reg16(reg, value as u32 as i32)
     };
 }
 
-pub unsafe fn decr_ecx_asize(is_asize_32: bool) -> i32 {
-    return if is_asize_32 {
-        write_reg32(ECX, read_reg32(ECX) - 1);
-        read_reg32(ECX)
+pub unsafe fn decr_ecx_asize(is_asize_32: bool) -> u64 {
+    if *is_64 && *prefixes & prefix::PREFIX_MASK_ADDRSIZE == 0 {
+        // 64-bit address size in long mode: loop/jrcxz use rcx
+        let c = read_reg64(ECX).wrapping_sub(1);
+        write_reg64(ECX, c);
+        return c;
+    }
+    if is_asize_32 {
+        write_reg32(ECX, read_reg32(ECX).wrapping_sub(1));
+        read_reg32(ECX) as u32 as u64
     }
     else {
         write_reg16(CX, read_reg16(CX) - 1);
-        read_reg16(CX)
-    };
+        read_reg16(CX) as u32 as u64
+    }
 }
 
 #[no_mangle]
@@ -4345,24 +5637,19 @@ pub unsafe fn get_opstats_buffer(
 #[cfg(not(feature = "profiler"))]
 pub unsafe fn get_opstats_buffer() -> f64 { 0.0 }
 
-pub fn clear_tlb_code(page: i32) {
+pub fn clear_tlb_code(page: u64) {
     unsafe {
-        if let Some(c) = tlb_code[page as usize] {
-            drop(Box::from_raw(c.as_ptr()));
+        if let Some(slot) = tlb_code_slot(page) {
+            if let Some(c) = slot.take() {
+                drop(Box::from_raw(c.as_ptr()));
+            }
         }
-        tlb_code[page as usize] = None;
     }
 }
 
-pub unsafe fn invlpg(addr: i32) {
-    let page = (addr as u32 >> 12) as i32;
-    // Note: Doesn't remove this page from valid_tlb_entries: This isn't
-    // necessary, because when valid_tlb_entries grows too large, it will be
-    // empties by calling clear_tlb, which removes this entry as it isn't global.
-    // This however means that valid_tlb_entries can contain some invalid entries
-    clear_tlb_code(page);
-    tlb_data[page as usize] = 0;
-    *last_virt_eip = -1;
+pub unsafe fn invlpg(addr: u64) {
+    tlb_invalidate_page(addr);
+    *last_virt_eip64 = -1;
 }
 
 #[no_mangle]
@@ -4408,6 +5695,7 @@ pub unsafe fn get_valid_tlb_entries_count() -> i32 {
     let mut result = 0;
     for i in 0..valid_tlb_entries_count {
         let page = valid_tlb_entries[i as usize];
+        if page >= 0x10_0000 { continue; }
         let entry = tlb_data[page as usize];
         if 0 != entry {
             result += 1
@@ -4424,6 +5712,7 @@ pub unsafe fn get_valid_global_tlb_entries_count() -> i32 {
     let mut result = 0;
     for i in 0..valid_tlb_entries_count {
         let page = valid_tlb_entries[i as usize];
+        if page >= 0x10_0000 { continue; }
         let entry = tlb_data[page as usize];
         if 0 != entry & TLB_GLOBAL {
             result += 1
@@ -4456,21 +5745,94 @@ pub unsafe fn trigger_ss(code: i32) {
     call_interrupt_vector(CPU_EXCEPTION_SS, false, Some(code));
 }
 
+/// Page fault caused by an instruction fetch from an NX page.
+unsafe fn trigger_pagefault_nx(addr: u64) {
+    if config::LOG_PAGE_FAULTS {
+        dbg_log!("page fault nx eip={:x} cr2={:x}", *previous_ip, addr);
+        dbg_trace();
+    }
+    profiler::stat_increment(stat::PAGE_FAULT);
+    if cfg!(debug_assertions) {
+        let a = canonicalize_address(addr);
+        let pml4e = memory::read64s((*cr.offset(3) as u32 & 0xFFFF_F000) as u32) as u64;
+        let pdpte = memory::read64s(((pml4e & 0xFFFF_F000) + ((a >> 30 & 0x1FF) << 3)) as u32) as u64;
+        let pde = memory::read64s(((pdpte & 0xFFFF_F000) + ((a >> 21 & 0x1FF) << 3)) as u32) as u64;
+        dbg_log!(
+            "pfwalk: cr3={:x} pml4e={:x} pdpte={:x} pde={:x}",
+            *cr.offset(3),
+            pml4e,
+            pdpte,
+            pde
+        );
+    }
+    *cr.offset(2) = addr as u32 as i32;
+    *cr2_64 = addr;
+    tlb_invalidate_page(addr);
+    // user<<2 | write<<1 | present | instruction fetch
+    let error_code = ((*cpl == 3) as i32) << 2 | 1 | 1 << 4;
+    *instruction_pointer = *previous_ip;
+    call_interrupt_vector(CPU_EXCEPTION_PF, false, Some(error_code));
+}
+
+#[inline(never)]
+pub unsafe fn trigger_ts(code: i32) {
+    dbg_log!("#ts");
+    *instruction_pointer = *previous_ip;
+    if DEBUG {
+        if js::cpu_exception_hook(CPU_EXCEPTION_TS) {
+            return;
+        }
+    }
+    call_interrupt_vector(CPU_EXCEPTION_TS, false, Some(code));
+}
+
+/// #DF (double fault). Always delivered with a zero error code; the IDT gate
+/// for #DF must not itself fault (a second double fault while delivering #DF
+/// shuts the processor down, which we model as a panic).
+pub unsafe fn trigger_df(code: i32) {
+    dbg_log!("#df");
+    *instruction_pointer = *previous_ip;
+    if DEBUG {
+        if js::cpu_exception_hook(CPU_EXCEPTION_DF) {
+            return;
+        }
+    }
+    call_interrupt_vector(CPU_EXCEPTION_DF, false, Some(code));
+}
+
 #[no_mangle]
 pub unsafe fn store_current_tsc() { *current_tsc = read_tsc(); }
 
 #[no_mangle]
 pub unsafe fn handle_irqs() {
+    if *nmi_pending && !*nmi_blocked {
+        *nmi_pending = false;
+        *nmi_blocked = true;
+        *previous_ip = *instruction_pointer;
+        if *in_hlt {
+            js::stop_idling();
+            *in_hlt = false;
+        }
+        call_interrupt_vector(CPU_EXCEPTION_NMI, false, None);
+    }
     if *flags & FLAG_INTERRUPT != 0 {
         if let Some(irq) = pic::pic_acknowledge_irq() {
             pic_call_irq(irq)
         }
-        else if *acpi_enabled {
+        else if *apic_enabled {
             if let Some(irq) = apic::acknowledge_irq() {
                 pic_call_irq(irq)
             }
         }
     }
+}
+
+/// Latch an NMI (vector 2 through the IDT, not maskable by IF); it is
+/// delivered on the next instruction boundary, unless another NMI is in flight
+#[no_mangle]
+pub unsafe fn raise_nmi() {
+    *nmi_pending = true;
+    handle_irqs();
 }
 
 unsafe fn pic_call_irq(interrupt_nr: u8) {
@@ -4565,7 +5927,7 @@ pub unsafe fn reset_cpu() {
         *segment_offsets.offset(i) = 0;
         *segment_access_bytes.offset(i) = 0x80 | (0 << 5) | 0x10 | 0x02; // P dpl0 S RW
 
-        *reg32.offset(i) = 0;
+        *reg64.offset(i) = 0;
 
         *sreg.offset(i) = 0;
         *dreg.offset(i) = 0;
@@ -4574,6 +5936,11 @@ pub unsafe fn reset_cpu() {
 
         *fpu_st.offset(i) = softfloat::F80::ZERO;
     }
+    for i in 8..16 {
+        *reg64.offset(i) = 0;
+        write_xmm128_2(i as i32, 0, 0);
+    }
+
     *segment_access_bytes.offset(CS as isize) = 0x80 | (0 << 5) | 0x10 | 0x08 | 0x02; // P dpl0 S E RW
 
     for i in 0..4 {
@@ -4599,9 +5966,11 @@ pub unsafe fn reset_cpu() {
     // http://www.sandpile.org/x86/initial.htm
     *idtr_size = 0;
     *idtr_offset = 0;
+    *idtr_offset64 = 0;
 
     *gdtr_size = 0;
     *gdtr_offset = 0;
+    *gdtr_offset64 = 0;
 
     *cr = 1 << 30 | 1 << 29 | 1 << 4;
     *cr.offset(2) = 0;
@@ -4612,10 +5981,11 @@ pub unsafe fn reset_cpu() {
     *cpl = 0;
 
     *is_32 = false;
+    *is_64 = false;
     *stack_size_32 = false;
     *prefixes = 0;
 
-    *last_virt_eip = -1;
+    *last_virt_eip64 = -1;
 
     *instruction_counter = 0;
     *previous_ip = 0;
@@ -4624,6 +5994,9 @@ pub unsafe fn reset_cpu() {
     *sysenter_cs = 0;
     *sysenter_esp = 0;
     *sysenter_eip = 0;
+    *sysenter_esp64 = 0;
+    *sysenter_eip64 = 0;
+    *misc_enable = 0;
 
     *flags = FLAGS_DEFAULT;
     *flags_changed = 0;
@@ -4632,6 +6005,14 @@ pub unsafe fn reset_cpu() {
     *last_op_size = 0;
 
     *pat = 0x0007_0406_0007_0406;
+
+    // the local APIC is enabled at reset (IA32_APIC_BASE = 0xFEE00900 for the BSP)
+    *apic_enabled = true;
+
+    *nmi_pending = false;
+    *nmi_blocked = false;
+    in_interrupt_delivery = -1;
+    delivering_double_fault = false;
 
     set_tsc(0, 0);
 

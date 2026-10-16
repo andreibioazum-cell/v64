@@ -3,12 +3,14 @@ CLOSURE=$(CLOSURE_DIR)/compiler.jar
 NASM_TEST_DIR=./tests/nasm
 
 INSTRUCTION_TABLES=src/rust/gen/jit.rs src/rust/gen/jit0f.rs \
+		   src/rust/gen/jit64.rs src/rust/gen/jit64_0f.rs src/rust/gen/jit64_wrappers.rs \
 		   src/rust/gen/interpreter.rs src/rust/gen/interpreter0f.rs \
 		   src/rust/gen/analyzer.rs src/rust/gen/analyzer0f.rs \
 
 # Only the dependencies common to both generate_{jit,interpreter}.js
-GEN_DEPENDENCIES=$(filter-out gen/generate_interpreter.js gen/generate_jit.js gen/generate_analyzer.js, $(wildcard gen/*.js))
+GEN_DEPENDENCIES=$(filter-out gen/generate_interpreter.js gen/generate_jit.js gen/generate_jit64.js gen/generate_analyzer.js, $(wildcard gen/*.js))
 JIT_DEPENDENCIES=$(GEN_DEPENDENCIES) gen/generate_jit.js
+JIT64_DEPENDENCIES=$(GEN_DEPENDENCIES) gen/generate_jit64.js
 INTERPRETER_DEPENDENCIES=$(GEN_DEPENDENCIES) gen/generate_interpreter.js
 ANALYZER_DEPENDENCIES=$(GEN_DEPENDENCIES) gen/generate_analyzer.js
 
@@ -93,6 +95,7 @@ BROWSER_FILES=screen.js keyboard.js mouse.js speaker.js serial.js \
 RUST_FILES=$(shell find src/rust/ -name '*.rs') \
 	   src/rust/gen/interpreter.rs src/rust/gen/interpreter0f.rs \
 	   src/rust/gen/jit.rs src/rust/gen/jit0f.rs \
+	   src/rust/gen/jit64.rs src/rust/gen/jit64_0f.rs src/rust/gen/jit64_wrappers.rs \
 	   src/rust/gen/analyzer.rs src/rust/gen/analyzer0f.rs
 
 CORE_FILES:=$(addprefix src/,$(CORE_FILES))
@@ -195,6 +198,13 @@ src/rust/gen/jit.rs: $(JIT_DEPENDENCIES)
 	./gen/generate_jit.js --output-dir build/ --table jit
 src/rust/gen/jit0f.rs: $(JIT_DEPENDENCIES)
 	./gen/generate_jit.js --output-dir build/ --table jit0f
+
+src/rust/gen/jit64.rs: $(JIT64_DEPENDENCIES)
+	./gen/generate_jit64.js --output-dir build/ --table jit64
+src/rust/gen/jit64_0f.rs: $(JIT64_DEPENDENCIES)
+	./gen/generate_jit64.js --output-dir build/ --table jit64_0f
+src/rust/gen/jit64_wrappers.rs: $(JIT64_DEPENDENCIES)
+	./gen/generate_jit64.js --output-dir build/ --table jit64_wrappers
 
 src/rust/gen/interpreter.rs: $(INTERPRETER_DEPENDENCIES)
 	./gen/generate_interpreter.js --output-dir build/ --table interpreter
@@ -314,6 +324,11 @@ nasmtests-force-jit: build/v86-debug.wasm
 	$(NASM_TEST_DIR)/create_tests.js
 	$(NASM_TEST_DIR)/gen_fixtures.js
 	$(NASM_TEST_DIR)/run.js --force-jit
+
+longmode-tests: build/v86-debug.wasm
+	./tests/longmode/run.js
+	JIT_THRESHOLD=1 ./tests/longmode/run.js
+	./tests/longmode/multiboot64.js
 
 jitpagingtests: build/v86-debug.wasm
 	$(MAKE) -C tests/jit-paging test-jit test-jit-smc

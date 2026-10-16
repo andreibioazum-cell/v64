@@ -106,6 +106,7 @@ export function CPU(bus, wm, stop_idling)
 
     // current operand/address size
     this.is_32 = view(Int32Array, memory, 804, 1);
+    this.is_64 = view(Int32Array, memory, 272, 1);
 
     this.stack_size_32 = view(Int32Array, memory, 808, 1);
 
@@ -114,8 +115,8 @@ export function CPU(bus, wm, stop_idling)
      */
     this.in_hlt = view(Uint8Array, memory, 616, 1);
 
-    this.last_virt_eip = view(Int32Array, memory, 620, 1);
-    this.eip_phys = view(Int32Array, memory, 624, 1);
+    this.last_virt_eip = view(Int32Array, memory, 368, 2); // 64 bit (lo, hi)
+    this.eip_phys = view(Int32Array, memory, 376, 2); // 64 bit (lo, hi)
 
 
     this.sysenter_cs = view(Int32Array, memory, 636, 1);
@@ -146,8 +147,8 @@ export function CPU(bus, wm, stop_idling)
     /** @type {!Object} */
     this.devices = {};
 
-    this.instruction_pointer = view(Int32Array, memory, 556, 1);
-    this.previous_ip = view(Int32Array, memory, 560, 1);
+    this.instruction_pointer = view(Int32Array, memory, 256, 2); // 64 bit (lo, hi)
+    this.previous_ip = view(Int32Array, memory, 264, 2); // 64 bit (lo, hi)
 
     // configured by guest
     this.apic_enabled = view(Uint8Array, memory, 548, 1);
@@ -172,7 +173,10 @@ export function CPU(bus, wm, stop_idling)
     this.instruction_counter = view(Uint32Array, memory, 664, 1);
 
     // registers
-    this.reg32 = view(Int32Array, memory, 64, 8);
+    // 16 general purpose registers, 64 bits each (little-endian)
+    this.reg64 = view(BigUint64Array, memory, 128, 16);
+    // 32-bit view of the above: reg32s[r * 2] is the low half of r
+    this.reg32s = view(Int32Array, memory, 128, 32);
 
     this.fpu_st = view(Int32Array, memory, 1152, 4 * 8);
 
@@ -197,6 +201,8 @@ export function CPU(bus, wm, stop_idling)
     this.fpu_dp_selector[0] = 0;
 
     this.reg_xmm32s = view(Int32Array, memory, 832, 8 * 4);
+    // xmm8-15 (only addressable in 64-bit mode via REX)
+    this.reg_xmm32s_high = view(Int32Array, memory, 1408, 8 * 4);
 
     this.mxcsr = view(Int32Array, memory, 824, 1);
 
@@ -230,6 +236,18 @@ export function CPU(bus, wm, stop_idling)
 
     //Object.seal(this);
 }
+
+CPU.prototype.get_reg32 = function(r)
+{
+    return this.reg32s[r << 1];
+};
+
+CPU.prototype.set_reg32 = function(r, v)
+{
+    // 32-bit writes zero-extend into the full 64-bit register
+    this.reg32s[r << 1] = v | 0;
+    this.reg32s[(r << 1) + 1] = 0;
+};
 
 CPU.prototype.mmap_read8 = function(addr)
 {
@@ -475,11 +493,12 @@ CPU.prototype.get_state = function()
     state[11] = this.cpl[0];
 
     state[13] = this.is_32[0];
+    state[96] = this.is_64[0];
 
     state[16] = this.stack_size_32[0];
     state[17] = this.in_hlt[0];
-    state[18] = this.last_virt_eip[0];
-    state[19] = this.eip_phys[0];
+    state[18] = [this.last_virt_eip[0], this.last_virt_eip[1]];
+    state[19] = [this.eip_phys[0], this.eip_phys[1]];
 
     state[22] = this.sysenter_cs[0];
     state[23] = this.sysenter_eip[0];
@@ -491,9 +510,21 @@ CPU.prototype.get_state = function()
 
     state[30] = this.last_op_size[0];
 
-    state[37] = this.instruction_pointer[0];
-    state[38] = this.previous_ip[0];
-    state[39] = this.reg32;
+    state[37] = [this.instruction_pointer[0], this.instruction_pointer[1]];
+    state[38] = [this.previous_ip[0], this.previous_ip[1]];
+    // low halves of r0-r7 (kept for compatibility with older state images)
+    state[39] = new Int32Array(8);
+    // high halves of r0-r7
+    state[94] = new Int32Array(8);
+    // r8-r15 as interleaved lo/hi pairs
+    state[95] = new Int32Array(16);
+    for(let i = 0; i < 8; i++)
+    {
+        state[39][i] = this.reg32s[i << 1];
+        state[94][i] = this.reg32s[(i << 1) + 1];
+        state[95][i << 1] = this.reg32s[16 + (i << 1)];
+        state[95][(i << 1) + 1] = this.reg32s[16 + (i << 1) + 1];
+    }
     state[40] = this.sreg;
     state[41] = this.dreg;
     state[42] = this.reg_pdpte;
@@ -541,6 +572,7 @@ CPU.prototype.get_state = function()
     state[64] = this.tss_size_32[0];
 
     state[66] = this.reg_xmm32s;
+    state[97] = this.reg_xmm32s_high;
 
     state[67] = this.fpu_st;
     state[68] = this.fpu_stack_empty[0];
@@ -665,12 +697,15 @@ CPU.prototype.set_state = function(state)
     this.cpl[0] = state[11];
 
     this.is_32[0] = state[13];
+    this.is_64[0] = state[96] || 0;
 
     this.stack_size_32[0] = state[16];
 
     this.in_hlt[0] = state[17];
-    this.last_virt_eip[0] = state[18];
-    this.eip_phys[0] = state[19];
+    this.last_virt_eip[0] = state[18] ? state[18][0] : -1;
+    this.last_virt_eip[1] = state[18] ? state[18][1] : -1;
+    this.eip_phys[0] = state[19] ? state[19][0] : 0;
+    this.eip_phys[1] = state[19] ? state[19][1] : 0;
 
     this.sysenter_cs[0] = state[22];
     this.sysenter_eip[0] = state[23];
@@ -683,9 +718,17 @@ CPU.prototype.set_state = function(state)
 
     this.last_op_size[0] = state[30];
 
-    this.instruction_pointer[0] = state[37];
-    this.previous_ip[0] = state[38];
-    this.reg32.set(state[39]);
+    this.instruction_pointer[0] = state[37] ? state[37][0] : 0;
+    this.instruction_pointer[1] = state[37] ? state[37][1] : 0;
+    this.previous_ip[0] = state[38] ? state[38][0] : 0;
+    this.previous_ip[1] = state[38] ? state[38][1] : 0;
+    for(let i = 0; i < 8; i++)
+    {
+        this.reg32s[i << 1] = state[39][i];
+        this.reg32s[(i << 1) + 1] = state[94] ? state[94][i] : 0;
+        this.reg32s[16 + (i << 1)] = state[95] ? state[95][i << 1] : 0;
+        this.reg32s[16 + (i << 1) + 1] = state[95] ? state[95][(i << 1) + 1] : 0;
+    }
     this.sreg.set(state[40]);
     this.dreg.set(state[41]);
     state[42] && this.reg_pdpte.set(state[42]);
@@ -751,6 +794,7 @@ CPU.prototype.set_state = function(state)
     this.tss_size_32[0] = state[64];
 
     this.reg_xmm32s.set(state[66]);
+    state[97] && this.reg_xmm32s_high.set(state[97]);
 
     this.fpu_st.set(state[67]);
     this.fpu_stack_empty[0] = state[68];
@@ -1276,7 +1320,7 @@ CPU.prototype.init = function(settings, device_bus)
             else
             {
                 dbg_log("loaded multiboot without bios", LOG_CPU);
-                this.reg32[REG_EAX] = this.io.port_read32(0xF4);
+                this.set_reg32(REG_EAX, this.io.port_read32(0xF4));
             }
         }
     }
@@ -1295,7 +1339,7 @@ CPU.prototype.load_multiboot = function (buffer)
     if(option_rom)
     {
         dbg_log("loaded multiboot", LOG_CPU);
-        this.reg32[REG_EAX] = this.io.port_read32(0xF4);
+        this.set_reg32(REG_EAX, this.io.port_read32(0xF4));
     }
 };
 
@@ -1454,7 +1498,10 @@ CPU.prototype.load_multiboot_option_rom = function(buffer, initrd, cmdline)
 
                 const elf = read_elf(buffer);
 
-                entrypoint = elf.header.entry;
+                // BigInt for 64-bit images (see elf.js)
+                const elf_entry = BigInt(elf.header.entry);
+                let entry_adjusted = false;
+                entrypoint = Number(BigInt.asUintN(32, elf_entry));
 
                 for(const program of elf.program_headers)
                 {
@@ -1481,9 +1528,11 @@ CPU.prototype.load_multiboot_option_rom = function(buffer, initrd, cmdline)
                             // Since multiboot specifies that paging is disabled, we load to the physical address;
                             // but the entry point is specified in virtual addresses so adjust the entrypoint if needed
 
-                            if(entrypoint === elf.header.entry && program.vaddr <= entrypoint && (program.vaddr + program.memsz) > entrypoint)
+                            const vaddr = BigInt(program.vaddr);
+                            if(!entry_adjusted && vaddr <= elf_entry && vaddr + BigInt(program.memsz) > elf_entry)
                             {
-                                entrypoint = (entrypoint - program.vaddr) + program.paddr;
+                                entrypoint = Number(elf_entry - vaddr) + program.paddr;
+                                entry_adjusted = true;
                             }
                         }
                         else
@@ -1510,6 +1559,10 @@ CPU.prototype.load_multiboot_option_rom = function(buffer, initrd, cmdline)
                         dbg_assert(false, "unimplemented elf section type: " + h(program.type));
                     }
                 }
+
+                // multiboot always enters in 32-bit protected mode, so 64-bit images
+                // need a 32-bit entry point inside a loaded segment
+                dbg_assert(entry_adjusted || elf_entry < BigInt(0x100000000), "elf entry point not reachable from 32-bit mode: " + elf_entry.toString(16));
             }
             else
             {
@@ -1546,7 +1599,7 @@ CPU.prototype.load_multiboot_option_rom = function(buffer, initrd, cmdline)
 
             // set state for multiboot
 
-            cpu.reg32[REG_EBX] = multiboot_info_addr;
+            cpu.set_reg32(REG_EBX, multiboot_info_addr);
             cpu.cr[0] = 1;
             cpu.protected_mode[0] = +true;
             cpu.flags[0] = FLAGS_DEFAULT;
@@ -1927,8 +1980,9 @@ CPU.prototype.run_hardware_timers = function(acpi_enabled, now)
     if(acpi_enabled)
     {
         acpi_time = this.devices.acpi.timer(now);
-        apic_time = this.apic_timer(now);
     }
+    // the local APIC exists independently of ACPI
+    apic_time = this.apic_timer(now);
 
     return Math.min(pit_time, rtc_time, acpi_time, apic_time);
 };
@@ -1964,7 +2018,7 @@ CPU.prototype.dump_stack = function(start, end)
 {
     if(!DEBUG) return;
 
-    var esp = this.reg32[REG_ESP];
+    var esp = this.get_reg32(REG_ESP);
     dbg_log("========= STACK ==========");
 
     if(end >= start || end === undefined)
@@ -1996,7 +2050,7 @@ CPU.prototype.debug_get_state = function(where)
     var iopl = this.getiopl();
     var cpl = this.cpl[0];
     var cs_eip = h(this.sreg[REG_CS], 4) + ":" + h(this.get_real_eip() >>> 0, 8);
-    var ss_esp = h(this.sreg[REG_SS], 4) + ":" + h(this.reg32[REG_ES] >>> 0, 8);
+    var ss_esp = h(this.sreg[REG_SS], 4) + ":" + h(this.get_reg32(REG_ES) >>> 0, 8);
     var op_size = this.is_32[0] ? "32" : "16";
     var if_ = (this.flags[0] & FLAG_INTERRUPT) ? 1 : 0;
 
@@ -2060,8 +2114,8 @@ CPU.prototype.get_regs_short = function()
 
     for(var i = 0; i < 4; i++)
     {
-        line1 += r32_names[i] + "="  + h(this.reg32[r32[r32_names[i]]] >>> 0, 8) + " ";
-        line2 += r32_names[i+4] + "="  + h(this.reg32[r32[r32_names[i+4]]] >>> 0, 8) + " ";
+        line1 += r32_names[i] + "="  + h(this.get_reg32(r32[r32_names[i]]) >>> 0, 8) + " ";
+        line2 += r32_names[i+4] + "="  + h(this.get_reg32(r32[r32_names[i+4]]) >>> 0, 8) + " ";
     }
 
     //line1 += " eip=" + h(this.get_real_eip() >>> 0, 8);

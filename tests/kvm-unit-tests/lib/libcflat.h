@@ -53,7 +53,7 @@ typedef uint64_t	u64;
 typedef int64_t		s64;
 typedef unsigned long	ulong;
 
-typedef _Bool		bool;
+#include <stdbool.h>
 #define false 0
 #define true  1
 

@@ -53,6 +53,7 @@ const TESTS_ASSUME_INTEL = false;
 // imm8, imm8s, imm16, imm1632, immaddr, extra_imm8, extra_imm16: one or two immediate bytes follows the instruction
 // custom: will callback jit to generate custom code
 // block_boundary: may change eip in a way not handled by the jit
+// not_block_boundary_in_64: block_boundary only outside of 64-bit mode
 // no_next_instruction: jit will stop analysing after instruction (e.g., unconditional jump, ret)
 const encodings = [
     { opcode: 0x06, os: 1, custom: 1 },
@@ -75,15 +76,15 @@ const encodings = [
     { opcode: 0x60, os: 1, block_boundary: 1 }, // pusha
     { opcode: 0x61, os: 1, block_boundary: 1 }, // popa
     { opcode: 0x62, e: 1, skip: 1 },
-    { opcode: 0x63, e: 1, block_boundary: 1 }, // arpl
+    { opcode: 0x63, e: 1, block_boundary: 1, not_block_boundary_in_64: 1 }, // arpl (movsxd in 64-bit mode)
     { opcode: 0x64, prefix: 1 },
     { opcode: 0x65, prefix: 1 },
     { opcode: 0x66, prefix: 1 },
     { opcode: 0x67, prefix: 1 },
 
-    { opcode: 0x68, custom: 1, os: 1, imm1632: 1 },
+    { opcode: 0x68, custom: 1, os: 1, imm1632: 1, d64: 1 },
     { opcode: 0x69, os: 1, e: 1, custom: 1, imm1632: 1, mask_flags: TESTS_ASSUME_INTEL ? af : sf | zf | af | pf },
-    { opcode: 0x6A, custom: 1, os: 1, imm8s: 1 },
+    { opcode: 0x6A, custom: 1, os: 1, imm8s: 1, d64: 1 },
     { opcode: 0x6B, os: 1, e: 1, custom: 1, imm8s: 1, mask_flags: TESTS_ASSUME_INTEL ? af : sf | zf | af | pf },
 
     { opcode: 0x6C, block_boundary: 1, custom: 1, is_string: 1, skip: 1 },          // ins
@@ -112,7 +113,7 @@ const encodings = [
     { opcode: 0x8C, os: 1, e: 1, custom: 1, skip: 1 }, // mov reg, sreg
     { opcode: 0x8D, reg_ud: 1, os: 1, e: 1, custom_modrm_resolve: 1, custom: 1 }, // lea
     { opcode: 0x8E, block_boundary: 1, e: 1, skip: 1 }, // mov sreg
-    { opcode: 0x8F, os: 1, e: 1, fixed_g: 0, custom_modrm_resolve: 1, custom: 1, block_boundary: 1 }, // pop r/m
+    { opcode: 0x8F, os: 1, e: 1, fixed_g: 0, custom_modrm_resolve: 1, custom: 1, block_boundary: 1, d64: 1 }, // pop r/m
 
     { opcode: 0x90, custom: 1 },
     { opcode: 0x91, custom: 1, os: 1 },
@@ -127,8 +128,8 @@ const encodings = [
     { opcode: 0x99, os: 1, custom: 1 },
     { opcode: 0x9A, os: 1, imm1632: 1, extra_imm16: 1, skip: 1, block_boundary: 1 }, // callf
     { opcode: 0x9B, block_boundary: 1, skip: 1 }, // fwait: block_boundary since it uses non-raising cpu exceptions
-    { opcode: 0x9C, os: 1, custom: 1, skip: 1 }, // pushf
-    { opcode: 0x9D, os: 1, custom: 1, skip: 1 }, // popf
+    { opcode: 0x9C, os: 1, custom: 1, skip: 1, d64: 1 }, // pushf
+    { opcode: 0x9D, os: 1, custom: 1, skip: 1, d64: 1 }, // popf
     { opcode: 0x9E, custom: 1 },
     { opcode: 0x9F, custom: 1 },
 
@@ -176,8 +177,8 @@ const encodings = [
     { opcode: 0xF2AF, block_boundary: 1, custom: 1, is_string: 1, os: 1 },
     { opcode: 0xF3AF, block_boundary: 1, custom: 1, is_string: 1, os: 1 },
 
-    { opcode: 0xC2, custom: 1, block_boundary: 1, no_next_instruction: 1, os: 1, absolute_jump: 1, imm16: 1, skip: 1 }, // ret
-    { opcode: 0xC3, custom: 1, block_boundary: 1, no_next_instruction: 1, os: 1, absolute_jump: 1, skip: 1 },
+    { opcode: 0xC2, custom: 1, block_boundary: 1, no_next_instruction: 1, os: 1, absolute_jump: 1, imm16: 1, skip: 1, d64: 1 }, // ret
+    { opcode: 0xC3, custom: 1, block_boundary: 1, no_next_instruction: 1, os: 1, absolute_jump: 1, skip: 1, d64: 1 },
 
     { opcode: 0xC4, block_boundary: 1, os: 1, e: 1, skip: 1 }, // les
     { opcode: 0xC5, block_boundary: 1, os: 1, e: 1, skip: 1 }, // lds
@@ -186,15 +187,15 @@ const encodings = [
     { opcode: 0xC7, custom: 1, os: 1, e: 1, fixed_g: 0, imm1632: 1 },
 
     // XXX: Temporary block boundary
-    { opcode: 0xC8, os: 1, imm16: 1, extra_imm8: 1, block_boundary: 1 }, // enter
-    { opcode: 0xC9, custom: 1, os: 1, skip: 1 }, // leave
+    { opcode: 0xC8, os: 1, imm16: 1, extra_imm8: 1, block_boundary: 1, d64: 1 }, // enter
+    { opcode: 0xC9, custom: 1, os: 1, skip: 1, d64: 1 }, // leave
 
     { opcode: 0xCA, block_boundary: 1, no_next_instruction: 1, os: 1, imm16: 1, skip: 1 }, // retf
     { opcode: 0xCB, block_boundary: 1, no_next_instruction: 1, os: 1, skip: 1 },
     { opcode: 0xCC, block_boundary: 1, skip: 1 }, // int
     { opcode: 0xCD, block_boundary: 1, skip: 1, imm8: 1 },
     { opcode: 0xCE, block_boundary: 1, skip: 1 },
-    { opcode: 0xCF, block_boundary: 1, no_next_instruction: 1, os: 1, skip: 1 }, // iret
+    { opcode: 0xCF, block_boundary: 1, no_next_instruction: 1, os: 1, skip: 1, d64: 1 }, // iret
 
     { opcode: 0xD4, imm8: 1, block_boundary: 1 }, // aam, may trigger #de
     { opcode: 0xD5, imm8: 1, mask_flags: of | cf | af },
@@ -286,7 +287,7 @@ const encodings = [
     { opcode: 0xE6, block_boundary: 1, imm8: 1, skip: 1 }, // out
     { opcode: 0xE7, block_boundary: 1, os: 1, imm8: 1, skip: 1 },
 
-    { opcode: 0xE8, block_boundary: 1, jump_offset_imm: 1, os: 1, imm1632: 1, custom: 1, skip: 1 }, // call
+    { opcode: 0xE8, block_boundary: 1, jump_offset_imm: 1, os: 1, imm1632: 1, custom: 1, skip: 1, d64: 1 }, // call
     { opcode: 0xE9, block_boundary: 1, no_block_boundary_in_interpreted: 1, jump_offset_imm: 1, no_next_instruction: 1, os: 1, imm1632: 1, custom: 1, skip: 1 },
     { opcode: 0xEA, block_boundary: 1, no_next_instruction: 1, os: 1, imm1632: 1, extra_imm16: 1, skip: 1 }, // jmpf
     { opcode: 0xEB, block_boundary: 1, no_block_boundary_in_interpreted: 1, jump_offset_imm: 1, no_next_instruction: 1, os: 1, imm8s: 1, custom: 1, skip: 1 },
@@ -332,13 +333,13 @@ const encodings = [
 
     { opcode: 0xFE, e: 1, fixed_g: 0, custom: 1 },
     { opcode: 0xFE, e: 1, fixed_g: 1, custom: 1 },
-    { opcode: 0xFF, os: 1, e: 1, fixed_g: 0, custom: 1 },
-    { opcode: 0xFF, os: 1, e: 1, fixed_g: 1, custom: 1 },
-    { opcode: 0xFF, os: 1, e: 1, fixed_g: 2, custom: 1, block_boundary: 1, absolute_jump: 1, skip: 1 },
-    { opcode: 0xFF, os: 1, e: 1, fixed_g: 3, block_boundary: 1, skip: 1 },
-    { opcode: 0xFF, os: 1, e: 1, fixed_g: 4, custom: 1, block_boundary: 1, absolute_jump: 1, no_next_instruction: 1, skip: 1 },
-    { opcode: 0xFF, os: 1, e: 1, fixed_g: 5, block_boundary: 1, no_next_instruction: 1, skip: 1 },
-    { opcode: 0xFF, custom: 1, os: 1, e: 1, fixed_g: 6 },
+    { opcode: 0xFF, os: 1, e: 1, fixed_g: 0, custom: 1, d64: 1 },
+    { opcode: 0xFF, os: 1, e: 1, fixed_g: 1, custom: 1, d64: 1 },
+    { opcode: 0xFF, os: 1, e: 1, fixed_g: 2, custom: 1, block_boundary: 1, absolute_jump: 1, skip: 1, d64: 1 },
+    { opcode: 0xFF, os: 1, e: 1, fixed_g: 3, block_boundary: 1, skip: 1, d64: 1 },
+    { opcode: 0xFF, os: 1, e: 1, fixed_g: 4, custom: 1, block_boundary: 1, absolute_jump: 1, no_next_instruction: 1, skip: 1, d64: 1 },
+    { opcode: 0xFF, os: 1, e: 1, fixed_g: 5, block_boundary: 1, no_next_instruction: 1, skip: 1, d64: 1 },
+    { opcode: 0xFF, custom: 1, os: 1, e: 1, fixed_g: 6, d64: 1 },
 
     { opcode: 0x0F00, fixed_g: 0, e: 1, skip: 1, block_boundary: 1, os: 1 }, // sldt, ...
     { opcode: 0x0F00, fixed_g: 1, e: 1, skip: 1, block_boundary: 1, os: 1 },
@@ -412,13 +413,13 @@ const encodings = [
     { opcode: 0x0F3E, skip: 1, block_boundary: 1 },
     { opcode: 0x0F3F, skip: 1, block_boundary: 1 },
 
-    { opcode: 0x0FA0, os: 1, custom: 1 },
-    { opcode: 0x0FA1, os: 1, block_boundary: 1, skip: 1 }, // pop fs: block_boundary since it uses non-raising cpu exceptions
+    { opcode: 0x0FA0, os: 1, custom: 1, d64: 1 },
+    { opcode: 0x0FA1, os: 1, block_boundary: 1, skip: 1, d64: 1 }, // pop fs: block_boundary since it uses non-raising cpu exceptions
 
     { opcode: 0x0FA2, skip: 1 },
 
-    { opcode: 0x0FA8, os: 1, custom: 1 },
-    { opcode: 0x0FA9, os: 1, block_boundary: 1, skip: 1 }, // pop gs
+    { opcode: 0x0FA8, os: 1, custom: 1, d64: 1 },
+    { opcode: 0x0FA9, os: 1, block_boundary: 1, skip: 1, d64: 1 }, // pop gs
 
     { opcode: 0x0FA3, os: 1, e: 1, custom: 1, skip_mem: 1 }, // bt (can also index memory, but not supported by test right now)
     { opcode: 0x0FAB, os: 1, e: 1, custom: 1, skip_mem: 1 },
@@ -831,8 +832,8 @@ for(let i = 0; i < 8; i++)
         { opcode: 0x40 | i, os: 1, custom: 1 },
         { opcode: 0x48 | i, os: 1, custom: 1 },
 
-        { opcode: 0x50 | i, custom: 1, os: 1 },
-        { opcode: 0x58 | i, custom: 1, os: 1 },
+        { opcode: 0x50 | i, custom: 1, os: 1, d64: 1 },
+        { opcode: 0x58 | i, custom: 1, os: 1, d64: 1 },
 
         { opcode: 0x70 | i, block_boundary: 1, no_block_boundary_in_interpreted: 1, jump_offset_imm: 1, conditional_jump: 1, os: 1, imm8s: 1, custom: 1, skip: 1 },
         { opcode: 0x78 | i, block_boundary: 1, no_block_boundary_in_interpreted: 1, jump_offset_imm: 1, conditional_jump: 1, os: 1, imm8s: 1, custom: 1, skip: 1 },
@@ -843,7 +844,7 @@ for(let i = 0; i < 8; i++)
         { opcode: 0x83, os: 1, e: 1, fixed_g: i, imm8s: 1, custom: 1 },
 
         { opcode: 0xB0 | i, custom: 1, imm8: 1 },
-        { opcode: 0xB8 | i, custom: 1, os: 1, imm1632: 1 },
+        { opcode: 0xB8 | i, custom: 1, os: 1, imm1632: 1, imm3264: 1 },
 
         // note: overflow flag only undefined if shift is > 1
         // note: the adjust flag is undefined for shifts > 0 and unaffected by rotates

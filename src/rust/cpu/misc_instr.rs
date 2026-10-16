@@ -7,6 +7,11 @@ use crate::paging::OrPageFault;
 
 pub unsafe fn getcf() -> bool {
     if 0 != *flags_changed & 1 {
+        if *last_op_size == OPSIZE_64 {
+            let sub_mask = (*flags_changed >> 31) as i64 as u64;
+            // sub: last_op1 < last_result; add: last_result < last_op1
+            return (*last_result_64 ^ sub_mask) < (*last_op1_64 ^ sub_mask);
+        }
         let m = (2 << *last_op_size) - 1;
         dbg_assert!((*last_op1 as u32) <= m);
         dbg_assert!((*last_result as u32) <= m);
@@ -24,8 +29,9 @@ pub unsafe fn getcf() -> bool {
 #[no_mangle]
 pub unsafe fn getpf() -> bool {
     if 0 != *flags_changed & FLAG_PARITY {
+        let result = if *last_op_size == OPSIZE_64 { *last_result_64 as i32 } else { *last_result };
         // inverted lookup table
-        return 0 != 0x9669 << 2 >> ((*last_result ^ *last_result >> 4) & 15) & FLAG_PARITY;
+        return 0 != 0x9669 << 2 >> ((result ^ result >> 4) & 15) & FLAG_PARITY;
     }
     else {
         return 0 != *flags & FLAG_PARITY;
@@ -33,6 +39,15 @@ pub unsafe fn getpf() -> bool {
 }
 pub unsafe fn getaf() -> bool {
     if 0 != *flags_changed & FLAG_ADJUST {
+        if *last_op_size == OPSIZE_64 {
+            let last_op2 = if *flags_changed & FLAG_SUB != 0 {
+                (*last_op1_64).wrapping_sub(*last_result_64)
+            }
+            else {
+                (*last_result_64).wrapping_sub(*last_op1_64)
+            };
+            return 0 != (*last_op1_64 ^ last_op2 ^ *last_result_64) & (FLAG_ADJUST as u64);
+        }
         let is_sub = *flags_changed & FLAG_SUB != 0;
         let last_op2 = (*last_result - *last_op1) * if is_sub { -1 } else { 1 };
         return 0 != (*last_op1 ^ last_op2 ^ *last_result) & FLAG_ADJUST;
@@ -43,6 +58,9 @@ pub unsafe fn getaf() -> bool {
 }
 pub unsafe fn getzf() -> bool {
     if 0 != *flags_changed & FLAG_ZERO {
+        if *last_op_size == OPSIZE_64 {
+            return 0 != (!*last_result_64 & (*last_result_64).wrapping_sub(1)) >> 63 & 1;
+        }
         return 0 != (!*last_result & *last_result - 1) >> *last_op_size & 1;
     }
     else {
@@ -51,6 +69,9 @@ pub unsafe fn getzf() -> bool {
 }
 pub unsafe fn getsf() -> bool {
     if 0 != *flags_changed & FLAG_SIGN {
+        if *last_op_size == OPSIZE_64 {
+            return 0 != *last_result_64 >> 63 & 1;
+        }
         return 0 != *last_result >> *last_op_size & 1;
     }
     else {
@@ -59,6 +80,12 @@ pub unsafe fn getsf() -> bool {
 }
 pub unsafe fn getof() -> bool {
     if 0 != *flags_changed & FLAG_OVERFLOW {
+        if *last_op_size == OPSIZE_64 {
+            let is_sub = ((*flags_changed as u32) >> 31) as u64;
+            let b_xor_1_if_sub = (*last_result_64).wrapping_sub(*last_op1_64).wrapping_sub(is_sub);
+            return 0
+                != ((*last_op1_64 ^ *last_result_64) & (b_xor_1_if_sub ^ *last_result_64)) >> 63 & 1;
+        }
         let is_sub = (*flags_changed as u32) >> 31;
 
         // add: (a ^ result) & (b ^ result)
@@ -94,7 +121,10 @@ pub unsafe fn test_nle() -> bool { return !test_le(); }
 pub unsafe fn jmp_rel16(rel16: i32) {
     let cs_offset = get_seg_cs();
     // limit ip to 16 bit
-    *instruction_pointer = cs_offset + (*instruction_pointer - cs_offset + rel16 & 0xFFFF);
+    *instruction_pointer = (cs_offset as u64).wrapping_add(
+        ((*instruction_pointer).wrapping_sub(cs_offset as u64).wrapping_add(rel16 as i64 as u64))
+            & 0xFFFF,
+    );
 }
 pub unsafe fn jmpcc16(condition: bool, imm16: i32) {
     if condition {
@@ -103,7 +133,7 @@ pub unsafe fn jmpcc16(condition: bool, imm16: i32) {
 }
 pub unsafe fn jmpcc32(condition: bool, imm32: i32) {
     if condition {
-        *instruction_pointer += imm32
+        *instruction_pointer = (*instruction_pointer).wrapping_add(imm32 as i64 as u64)
     };
 }
 pub unsafe fn loope16(imm8s: i32) { jmpcc16(0 != decr_ecx_asize(is_asize_32()) && getzf(), imm8s); }
@@ -127,15 +157,19 @@ pub unsafe fn cmovcc16(condition: bool, value: i32, r: i32) {
 pub unsafe fn cmovcc32(condition: bool, value: i32, r: i32) {
     if condition {
         write_reg32(r, value);
-    };
+    }
+    else if *is_64 {
+        // the destination is written (zero-extended) even if the condition is false
+        write_reg32(r, read_reg32(r));
+    }
 }
 
-pub unsafe fn get_stack_pointer(offset: i32) -> i32 {
+pub unsafe fn get_stack_pointer(offset: i32) -> u64 {
     if *stack_size_32 {
-        return get_seg_ss() + read_reg32(ESP) + offset;
+        return get_seg_ss().wrapping_add(read_reg32(ESP)).wrapping_add(offset) as u32 as u64;
     }
     else {
-        return get_seg_ss() + (read_reg16(SP) + offset & 0xFFFF);
+        return get_seg_ss().wrapping_add(read_reg16(SP).wrapping_add(offset) & 0xFFFF) as u32 as u64;
     };
 }
 pub unsafe fn adjust_stack_reg(adjustment: i32) {
@@ -148,20 +182,20 @@ pub unsafe fn adjust_stack_reg(adjustment: i32) {
 }
 
 pub unsafe fn push16_ss16(imm16: i32) -> OrPageFault<()> {
-    let sp = get_seg_ss() + (read_reg16(SP) - 2 & 0xFFFF);
-    safe_write16(sp, imm16)?;
+    let sp = get_seg_ss().wrapping_add(read_reg16(SP) - 2 & 0xFFFF);
+    safe_write16(sp as u32 as u64, imm16)?;
     write_reg16(SP, read_reg16(SP) - 2);
     Ok(())
 }
 pub unsafe fn push16_ss32(imm16: i32) -> OrPageFault<()> {
-    let sp = get_seg_ss() + read_reg32(ESP) - 2;
-    safe_write16(sp, imm16)?;
+    let sp = get_seg_ss().wrapping_add(read_reg32(ESP)).wrapping_sub(2);
+    safe_write16(sp as u32 as u64, imm16)?;
     write_reg32(ESP, read_reg32(ESP) - 2);
     Ok(())
 }
 
-pub unsafe fn push16_ss16_mem(addr: i32) -> OrPageFault<()> { push16_ss16(safe_read16(addr)?) }
-pub unsafe fn push16_ss32_mem(addr: i32) -> OrPageFault<()> { push16_ss32(safe_read16(addr)?) }
+pub unsafe fn push16_ss16_mem(addr: u64) -> OrPageFault<()> { push16_ss16(safe_read16(addr)?) }
+pub unsafe fn push16_ss32_mem(addr: u64) -> OrPageFault<()> { push16_ss32(safe_read16(addr)?) }
 
 pub unsafe fn push16(imm16: i32) -> OrPageFault<()> {
     if *stack_size_32 {
@@ -174,19 +208,19 @@ pub unsafe fn push16(imm16: i32) -> OrPageFault<()> {
 
 pub unsafe fn push32_ss16(imm32: i32) -> OrPageFault<()> {
     let new_sp = read_reg16(SP) - 4 & 0xFFFF;
-    safe_write32(get_seg_ss() + new_sp, imm32)?;
+    safe_write32(get_seg_ss().wrapping_add(new_sp) as u32 as u64, imm32)?;
     write_reg16(SP, new_sp);
     Ok(())
 }
 pub unsafe fn push32_ss32(imm32: i32) -> OrPageFault<()> {
     let new_esp = read_reg32(ESP) - 4;
-    safe_write32(get_seg_ss() + new_esp, imm32)?;
+    safe_write32(get_seg_ss().wrapping_add(new_esp) as u32 as u64, imm32)?;
     write_reg32(ESP, new_esp);
     Ok(())
 }
 
-pub unsafe fn push32_ss16_mem(addr: i32) -> OrPageFault<()> { push32_ss16(safe_read32s(addr)?) }
-pub unsafe fn push32_ss32_mem(addr: i32) -> OrPageFault<()> { push32_ss32(safe_read32s(addr)?) }
+pub unsafe fn push32_ss16_mem(addr: u64) -> OrPageFault<()> { push32_ss16(safe_read32s(addr)?) }
+pub unsafe fn push32_ss32_mem(addr: u64) -> OrPageFault<()> { push32_ss32(safe_read32s(addr)?) }
 
 pub unsafe fn push32(imm32: i32) -> OrPageFault<()> {
     if *stack_size_32 {
@@ -201,12 +235,12 @@ pub unsafe fn push32_sreg(i: i32) -> OrPageFault<()> {
     // you can't make this up ...
     if *stack_size_32 {
         let new_esp = read_reg32(ESP) - 4;
-        safe_write16(get_seg_ss() + new_esp, *sreg.offset(i as isize) as i32)?;
+        safe_write16(get_seg_ss().wrapping_add(new_esp) as u32 as u64, *sreg.offset(i as isize) as i32)?;
         write_reg32(ESP, new_esp);
     }
     else {
         let new_sp = read_reg16(SP) - 4 & 0xFFFF;
-        safe_write16(get_seg_ss() + new_sp, *sreg.offset(i as isize) as i32)?;
+        safe_write16(get_seg_ss().wrapping_add(new_sp) as u32 as u64, *sreg.offset(i as isize) as i32)?;
         write_reg16(SP, new_sp);
     }
     Ok(())
@@ -221,14 +255,14 @@ pub unsafe fn pop16() -> OrPageFault<i32> {
     }
 }
 pub unsafe fn pop16_ss16() -> OrPageFault<i32> {
-    let sp = get_seg_ss() + read_reg16(SP);
-    let result = safe_read16(sp)?;
+    let sp = get_seg_ss().wrapping_add(read_reg16(SP));
+    let result = safe_read16(sp as u32 as u64)?;
     write_reg16(SP, read_reg16(SP) + 2);
     Ok(result)
 }
 pub unsafe fn pop16_ss32() -> OrPageFault<i32> {
-    let esp = get_seg_ss() + read_reg32(ESP);
-    let result = safe_read16(esp)?;
+    let esp = get_seg_ss().wrapping_add(read_reg32(ESP));
+    let result = safe_read16(esp as u32 as u64)?;
     write_reg32(ESP, read_reg32(ESP) + 2);
     Ok(result)
 }
@@ -242,15 +276,43 @@ pub unsafe fn pop32s() -> OrPageFault<i32> {
 }
 pub unsafe fn pop32s_ss16() -> OrPageFault<i32> {
     let sp = read_reg16(SP);
-    let result = safe_read32s(get_seg_ss() + sp)?;
+    let result = safe_read32s(get_seg_ss().wrapping_add(sp) as u32 as u64)?;
     write_reg16(SP, sp + 4);
     Ok(result)
 }
 pub unsafe fn pop32s_ss32() -> OrPageFault<i32> {
     let esp = read_reg32(ESP);
-    let result = safe_read32s(get_seg_ss() + esp)?;
+    let result = safe_read32s(get_seg_ss().wrapping_add(esp) as u32 as u64)?;
     write_reg32(ESP, read_reg32(ESP) + 4);
     Ok(result)
+}
+
+// 64-bit stack operations (long mode): always use rsp, the ss base is 0
+pub unsafe fn get_stack_pointer64(offset: i32) -> u64 {
+    (get_seg_ss() as u32 as u64)
+        .wrapping_add(read_reg64(ESP))
+        .wrapping_add(offset as i64 as u64)
+}
+pub unsafe fn push64(value: u64) -> OrPageFault<()> {
+    let new_sp = read_reg64(ESP).wrapping_sub(8);
+    safe_write64(get_stack_pointer64(-8), value)?;
+    write_reg64(ESP, new_sp);
+    Ok(())
+}
+pub unsafe fn pop64() -> OrPageFault<u64> {
+    let result = safe_read64s(get_stack_pointer64(0))?;
+    write_reg64(ESP, read_reg64(ESP).wrapping_add(8));
+    Ok(result)
+}
+pub unsafe fn jmpcc64(condition: bool, imm32: i32) {
+    if condition {
+        *instruction_pointer = (*instruction_pointer).wrapping_add(imm32 as i64 as u64)
+    };
+}
+pub unsafe fn cmovcc64(condition: bool, value: u64, r: i32) {
+    if condition {
+        write_reg64(r, value);
+    };
 }
 pub unsafe fn pusha16() {
     let temp = read_reg16(SP);
@@ -279,7 +341,7 @@ pub unsafe fn pusha32() {
     push32(read_reg32(EDI)).unwrap();
 }
 
-pub unsafe fn lss16(addr: i32, reg: i32, seg: i32) {
+pub unsafe fn lss16(addr: u64, reg: i32, seg: i32) {
     let new_reg = return_on_pagefault!(safe_read16(addr));
     let new_seg = return_on_pagefault!(safe_read16(addr + 2));
 
@@ -290,7 +352,7 @@ pub unsafe fn lss16(addr: i32, reg: i32, seg: i32) {
     write_reg16(reg, new_reg);
 }
 
-pub unsafe fn lss32(addr: i32, reg: i32, seg: i32) {
+pub unsafe fn lss32(addr: u64, reg: i32, seg: i32) {
     let new_reg = return_on_pagefault!(safe_read32s(addr));
     let new_seg = return_on_pagefault!(safe_read16(addr + 4));
 
@@ -321,12 +383,15 @@ pub unsafe fn enter16(size: i32, mut nesting_level: i32) {
         let mut tmp_ebp = read_reg32(EBP);
         for _ in 1..nesting_level {
             tmp_ebp -= 2;
-            push16(safe_read16(ss + (tmp_ebp & ss_mask)).unwrap()).unwrap();
+            push16(safe_read16(ss.wrapping_add(tmp_ebp & ss_mask) as u32 as u64).unwrap()).unwrap();
         }
         push16(frame_temp).unwrap();
     }
 
-    return_on_pagefault!(safe_write16(ss + (frame_temp & ss_mask), read_reg16(BP)));
+    return_on_pagefault!(safe_write16(
+        ss.wrapping_add(frame_temp & ss_mask) as u32 as u64,
+        read_reg16(BP)
+    ));
     write_reg16(BP, frame_temp);
     adjust_stack_reg(-size - 2);
 }
@@ -351,24 +416,29 @@ pub unsafe fn enter32(size: i32, mut nesting_level: i32) {
         let mut tmp_ebp = read_reg32(EBP);
         for _ in 1..nesting_level {
             tmp_ebp -= 4;
-            push32(safe_read32s(ss + (tmp_ebp & ss_mask)).unwrap()).unwrap();
+            push32(safe_read32s(ss.wrapping_add(tmp_ebp & ss_mask) as u32 as u64).unwrap()).unwrap();
         }
         push32(frame_temp).unwrap();
     }
 
-    return_on_pagefault!(safe_write32(ss + (frame_temp & ss_mask), read_reg32(EBP)));
+    return_on_pagefault!(safe_write32(
+        ss.wrapping_add(frame_temp & ss_mask) as u32 as u64,
+        read_reg32(EBP)
+    ));
     write_reg32(EBP, frame_temp);
     adjust_stack_reg(-size - 4);
 }
 
 pub unsafe fn setcc_reg(condition: bool, r: i32) { write_reg8(r, condition as i32); }
-pub unsafe fn setcc_mem(condition: bool, addr: i32) {
+pub unsafe fn setcc_mem(condition: bool, addr: u64) {
     return_on_pagefault!(safe_write8(addr, condition as i32));
 }
 
-pub unsafe fn fxsave(addr: i32) {
+pub unsafe fn fxsave(addr: u64) {
     dbg_assert!(addr & 0xF == 0, "TODO: #gp");
-    return_on_pagefault!(writable_or_pagefault(addr, 288));
+    // 64-bit mode: XMM0-15 are saved (416 bytes); otherwise only XMM0-7 (288)
+    let xmm_count: u64 = if *is_64 { 16 } else { 8 };
+    return_on_pagefault!(writable_or_pagefault(addr, 160 + 16 * xmm_count as i32));
 
     safe_write16(addr + 0, (*fpu_control_word).into()).unwrap();
     safe_write16(addr + 2, fpu_load_status_word().into()).unwrap();
@@ -384,19 +454,20 @@ pub unsafe fn fxsave(addr: i32) {
 
     for i in 0..8 {
         let reg_index = i + *fpu_stack_ptr as i32 & 7;
-        fpu_store_m80(addr + 32 + (i << 4), *fpu_st.offset(reg_index as isize));
+        fpu_store_m80(addr + 32 + ((i << 4) as u64), *fpu_st.offset(reg_index as isize));
     }
 
     // If the OSFXSR bit in control register CR4 is not set, the FXSAVE
     // instruction may not save these registers. This behavior is
     // implementation dependent.
-    for i in 0..8 {
-        safe_write128(addr + 160 + (i << 4), *reg_xmm.offset(i as isize)).unwrap();
+    for i in 0..xmm_count {
+        safe_write128(addr + 160 + (i << 4), *reg_xmm_ptr(i as i32)).unwrap();
     }
 }
-pub unsafe fn fxrstor(addr: i32) {
+pub unsafe fn fxrstor(addr: u64) {
     dbg_assert!(addr & 0xF == 0, "TODO: #gp");
-    return_on_pagefault!(readable_or_pagefault(addr, 288));
+    let xmm_count: u64 = if *is_64 { 16 } else { 8 };
+    return_on_pagefault!(readable_or_pagefault(addr, 160 + 16 * xmm_count as i32));
 
     let new_mxcsr = safe_read32s(addr + 24).unwrap();
 
@@ -419,11 +490,11 @@ pub unsafe fn fxrstor(addr: i32) {
 
     for i in 0..8 {
         let reg_index = *fpu_stack_ptr as i32 + i & 7;
-        *fpu_st.offset(reg_index as isize) = fpu_load_m80(addr + 32 + (i << 4)).unwrap();
+        *fpu_st.offset(reg_index as isize) = fpu_load_m80(addr + 32 + ((i << 4) as u64)).unwrap();
     }
 
-    for i in 0..8 {
-        *reg_xmm.offset(i as isize) = safe_read128s(addr + 160 + (i << 4)).unwrap();
+    for i in 0..xmm_count {
+        *reg_xmm_ptr(i as i32) = safe_read128s(addr + 160 + ((i << 4) as u64)).unwrap();
     }
 }
 
