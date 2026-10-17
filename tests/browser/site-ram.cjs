@@ -97,6 +97,13 @@ function fail(message) {
         if(/Ошибка/.test(status)) fail("status shows an error: " + status);
         if(!/Работает/.test(status)) fail("status does not show running: " + status);
 
+        // Fullscreen must really engage on the screen container (the button and the emulator call).
+        await page.click("#fullscreen");
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const fullscreen_id = await page.evaluate(() => document.fullscreenElement && document.fullscreenElement.id);
+        console.log("fullscreen element: " + fullscreen_id);
+        if(fullscreen_id !== "screen_container") fail("fullscreen did not engage on #screen_container: " + fullscreen_id);
+
         await page.screenshot({ path: SHOT });
         console.log("screenshot: " + SHOT);
 

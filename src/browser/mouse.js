@@ -265,7 +265,12 @@ export function MouseAdapter(bus, screen_container)
         // meaningful absolute position can be reported
         if(screen_container && !document.pointerLockElement)
         {
-            const rect = screen_container.getBoundingClientRect();
+            // The picture is the canvas while graphics mode is shown: its box must be the
+            // picture box, so the absolute position is taken from it (the container can be larger).
+            const canvas = screen_container.getElementsByTagName("canvas")[0];
+            const target = canvas && canvas.style.display !== "none" && canvas.getBoundingClientRect().width > 0 ?
+                canvas : screen_container;
+            const rect = target.getBoundingClientRect();
             mouse.bus.send("mouse-absolute", [
                 e.clientX - rect.left, e.clientY - rect.top, rect.width, rect.height]);
         }

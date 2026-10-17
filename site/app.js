@@ -1,6 +1,6 @@
 // Page logic for the single-file build. ASSETS (base64 wasm and BIOS images) and
 // V86 (libv86.js) are inlined by tools/build-single-html.mjs.
-/* global ASSETS, V86, atob */
+/* global ASSETS, V86, atob, MutationObserver, ResizeObserver */
 
 (function()
 {
@@ -25,6 +25,7 @@
     var cad_btn = el("cad");
     var fullscreen_btn = el("fullscreen");
     var typing = el("typing");
+    var screen_container = el("screen_container");
     var status = el("status");
     var ram_select = el("ram");
 
@@ -70,6 +71,56 @@
 
     // Chrome reports device memory in GB (rounded, capped at 8); other browsers do not report it.
     // Guest RAM above half of the device memory is likely to fail, so warn about it.
+    // The emulator sets the canvas size in CSS pixels from the size measured at the moment of
+    // the change, so after a resize or fullscreen toggle the picture would not be refitted.
+    // Fit the canvas here, keeping the aspect ratio; mouse.js takes coordinates from this box.
+    function fit_canvas()
+    {
+        var canvas = screen_container.getElementsByTagName("canvas")[0];
+        if(!canvas || canvas.style.display === "none" || !canvas.width || !canvas.height)
+        {
+            return;
+        }
+
+        var in_fullscreen = document.fullscreenElement === screen_container;
+        var max_w = in_fullscreen ? window.innerWidth : screen_container.clientWidth;
+        var max_h = in_fullscreen ? window.innerHeight : Math.max(240, window.innerHeight * 0.7);
+        var scale = Math.min(max_w / canvas.width, max_h / canvas.height);
+        // whole-pixel scaling keeps the pixels sharp; below 1x just shrink
+        if(scale >= 1)
+        {
+            scale = Math.floor(scale);
+        }
+
+        var width = Math.round(canvas.width * scale) + "px";
+        var height = Math.round(canvas.height * scale) + "px";
+        if(canvas.style.width !== width)
+        {
+            canvas.style.width = width;
+        }
+        if(canvas.style.height !== height)
+        {
+            canvas.style.height = height;
+        }
+    }
+
+    if(window.MutationObserver)
+    {
+        new MutationObserver(fit_canvas).observe(screen_container, {
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["width", "height", "style"],
+        });
+    }
+    // The container changes size when it enters fullscreen or the window changes;
+    // resize and fullscreenchange are fallbacks for browsers that report them late.
+    if(window.ResizeObserver)
+    {
+        new ResizeObserver(fit_canvas).observe(screen_container);
+    }
+    window.addEventListener("resize", fit_canvas);
+    document.addEventListener("fullscreenchange", fit_canvas);
+
     function ram_warning()
     {
         var device_gb = navigator.deviceMemory;
