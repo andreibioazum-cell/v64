@@ -1,0 +1,51 @@
+name: Site
+
+# Publish a usable website artifact independently of the full test suite.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build website
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.17.0'
+      - name: Setup Rust
+        run: rustup target add wasm32-unknown-unknown
+      - name: Cache build dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/release/
+            build/wasm32-unknown-unknown/
+            closure-compiler/
+          key: ${{ runner.os }}-site-v1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'Makefile', '.cargo/**') }}
+          restore-keys: |
+            ${{ runner.os }}-site-v1-
+      - name: Build website
+        run: make build/v86_all.js build/v86.wasm
+      - name: Package website
+        run: |
+          mkdir -p site-artifact/build site-artifact/bios
+          cp index.html v86.css manifest.json site-artifact/
+          cp build/v86_all.js build/v86.wasm site-artifact/build/
+          cp bios/*.bin site-artifact/bios/
+      - name: Upload website
+        uses: actions/upload-artifact@v7
+        with:
+          name: v86-website
+          path: site-artifact/
+          if-no-files-found: error

@@ -10,10 +10,15 @@
     display: flex !important;
     align-items: center;
     justify-content: center;
+    background: #000;
 }
 #screen_container:fullscreen #vga {
-    width: auto !important;
-    height: 100% !important;
+    width: min(100vw, calc(100vh * var(--fullscreen-ratio, 1.333333))) !important;
+    height: min(100vh, calc(100vw / var(--fullscreen-ratio, 1.333333))) !important;
+    object-fit: contain;
+}
+#screen_container:fullscreen.fullscreen-force-format #vga {
+    object-fit: fill;
 }
 #runtime_infos, #filesystem_panel {
     float: left;

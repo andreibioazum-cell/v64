@@ -3239,6 +3239,39 @@ function init_ui(profile, settings, emulator)
         }
     };
 
+    // Fullscreen formatting changes presentation only, never the guest video mode.
+    function update_fullscreen_format()
+    {
+        const format = $("fullscreen_format").value;
+        const custom = format === "custom";
+        $("fullscreen_custom").hidden = !custom;
+        const canvas = $("vga");
+        let width = canvas.width || 4;
+        let height = canvas.height || 3;
+        if(custom)
+        {
+            const width_input = $("fullscreen_width");
+            const height_input = $("fullscreen_height");
+            if(!width_input.checkValidity() || !height_input.checkValidity()) return;
+            width = +width_input.value;
+            height = +height_input.value;
+        }
+        else if(format !== "native")
+        {
+            [width, height] = format.split(":").map(Number);
+        }
+        if(!(width > 0 && height > 0)) return;
+        $("screen_container").style.setProperty("--fullscreen-ratio", String(width / height));
+        $("screen_container").classList.toggle("fullscreen-force-format", format !== "native");
+    }
+
+    $("fullscreen_format").onchange = update_fullscreen_format;
+    $("fullscreen_width").onchange = update_fullscreen_format;
+    $("fullscreen_height").onchange = update_fullscreen_format;
+    emulator.add_listener("screen-set-size", update_fullscreen_format);
+    document.addEventListener("fullscreenchange", update_fullscreen_format);
+    update_fullscreen_format();
+
     $("fullscreen").onclick = function()
     {
         emulator.screen_go_fullscreen();
