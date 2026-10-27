@@ -231,3 +231,7 @@ repository under their own licenses:
 ## More questions?
 
 Shoot me an email to `copy@copy.sh`. Please report bugs on GitHub.
+
+### Fullscreen aspect ratio
+
+Before clicking **Go fullscreen**, choose **Fullscreen format**: original proportions, 4:3, 16:9, 16:10, or custom. For custom proportions, enter a positive width and height (for example, 1280 and 1024). These numbers define the display aspect ratio, not the guest resolution. The image fills the largest rectangle of that shape that fits on screen, with black bars outside it and no cropping. Forced proportions may stretch the image. Original proportions follow guest video mode changes automatically. These settings do not change the normal windowed scale or the guest OS video mode.

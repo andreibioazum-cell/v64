@@ -356,6 +356,19 @@
         <button id="toggle_mouse">Disable mouse</button>
         <button id="lock_mouse">Lock mouse</button>
         <button id="fullscreen">Go fullscreen</button>
+        <label>Fullscreen format:
+            <select id="fullscreen_format">
+                <option value="native">Original proportions</option>
+                <option value="4:3">4:3</option>
+                <option value="16:9">16:9</option>
+                <option value="16:10">16:10</option>
+                <option value="custom">Custom</option>
+            </select>
+        </label>
+        <span id="fullscreen_custom" hidden>
+            <label>Width <input id="fullscreen_width" type="number" min="1" max="16384" value="1920" style="width: 75px"></label>
+            <label>Height <input id="fullscreen_height" type="number" min="1" max="16384" value="1080" style="width: 75px"></label>
+        </span>
         <button id="take_screenshot">Take screenshot</button>
         <button id="mute">Mute</button>
         <button id="toggle_theatre">Enable theatre mode</button>
