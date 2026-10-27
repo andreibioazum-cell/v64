@@ -109,6 +109,8 @@ Here's an overview of the operating systems supported in v86:
 - SerenityOS works (only 32-bit versions).
 - [SkiftOS](https://skiftos.org/) works.
 
+Local raw hard disk images with `.hdd`, `.img`, `.bin`, or `.raw` extensions can be selected under **Hard disk image** or **Second hard disk image** in the custom configuration. No renaming is needed. The file must be a raw disk image; container formats (such as VHD, VMDK, or QCOW2) must first be converted to raw, regardless of their extension. If your image uses another extension, choose **All files** in the file picker.
+
 You can get some information on the disk images here: https://github.com/copy/images.
 
 ## How to build, run and embed?
