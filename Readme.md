@@ -235,3 +235,12 @@ Shoot me an email to `copy@copy.sh`. Please report bugs on GitHub.
 ### Fullscreen aspect ratio
 
 Before clicking **Go fullscreen**, choose **Fullscreen format**: original proportions, 4:3, 16:9, 16:10, or custom. For custom proportions, enter a positive width and height (for example, 1280 and 1024). These numbers define the display aspect ratio, not the guest resolution. The image fills the largest rectangle of that shape that fits on screen, with black bars outside it and no cropping. Forced proportions may stretch the image. Original proportions follow guest video mode changes automatically. These settings do not change the normal windowed scale or the guest OS video mode.
+
+### Website CI artifact
+
+The **Site → Build website** job produces the `v86-website` archive independently
+of the full CI test suite. Extract it and serve the directory with a static HTTP
+server (for example, `python3 -m http.server 8000`), then open `index.html`.
+This archive includes the browser bundle, WebAssembly, BIOS files, and stylesheet;
+it is not a single self-contained HTML file. Optional network-loaded profiles
+still need internet access. Full build and test checks remain enabled separately.
