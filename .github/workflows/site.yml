@@ -29,7 +29,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target/
+            build/release/
+            build/wasm32-unknown-unknown/
             closure-compiler/
           key: ${{ runner.os }}-site-v1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'Makefile', '.cargo/**') }}
           restore-keys: |
