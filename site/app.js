@@ -13,12 +13,16 @@
 
     var emulator = null;
     var iso_file = null;
+    var hdd_file = null;
+    var hdd_pending = false;
     var paused = false;
     var booted = false;
 
     var el = function(id) { return document.getElementById(id); };
     var iso_input = el("iso");
     var iso_name = el("iso_name");
+    var hdd_input = el("hdd");
+    var hdd_name = el("hdd_name");
     var start_btn = el("start");
     var pause_btn = el("pause");
     var reset_btn = el("reset");
@@ -42,6 +46,31 @@
     var wasm_bytes = decode_base64(ASSETS.wasm);
     var seabios = decode_base64(ASSETS.seabios);
     var vgabios = decode_base64(ASSETS.vgabios);
+
+    function format_size(bytes)
+    {
+        if(bytes >= 1024 * MiB)
+        {
+            return (bytes / (1024 * MiB)).toFixed(1) + " ГиБ";
+        }
+        if(bytes >= MiB)
+        {
+            return Math.round(bytes / MiB) + " МиБ";
+        }
+        return Math.max(1, Math.round(bytes / 1024)) + " КиБ";
+    }
+
+    // The machine boots from the hard disk when one is selected, from the CD otherwise,
+    // so at least one of the two images is required.
+    function boot_media_selected()
+    {
+        return !!(hdd_file || iso_file);
+    }
+
+    function update_start_gate()
+    {
+        start_btn.disabled = !boot_media_selected();
+    }
 
     function set_status(text)
     {
@@ -112,6 +141,32 @@
         set_status("Ошибка запуска: " + message + ". Выберите меньший объём ОЗУ и запустите снова.");
     }
 
+    // Insert the image into the running machine and reboot from it. The promise resolves
+    // once the geometry has been written to the CMOS, so the restart already sees the disk.
+    function swap_hdd(file)
+    {
+        set_status("Загрузка образа жёсткого диска…");
+        emulator.set_hda({ buffer: file }).then(function()
+        {
+            if(!emulator)
+            {
+                return;
+            }
+            emulator.restart();
+            if(paused)
+            {
+                // The machine was paused; a reboot does not resume it by itself.
+                emulator.run();
+            }
+            paused = false;
+            set_status("Перезапуск с образа жёсткого диска");
+            set_running_controls(true);
+        }, function(err)
+        {
+            set_status("Ошибка чтения образа жёсткого диска: " + (err && err.message ? err.message : String(err)));
+        });
+    }
+
     function start_with_ram(ram_mib)
     {
         try
@@ -144,7 +199,11 @@
             vga_memory_size: 8 * MiB,
             bios: { buffer: seabios.buffer },
             vga_bios: { buffer: vgabios.buffer },
-            cdrom: { buffer: iso_file },
+            // The hard disk goes first in the boot order when it is present; the
+            // CD-ROM must be omitted entirely (not set to a null buffer) so that a
+            // hard-disk-only start works.
+            hda: hdd_file ? { buffer: hdd_file } : undefined,
+            cdrom: iso_file ? { buffer: iso_file } : undefined,
             autostart: true,
             disable_speaker: true,
         });
@@ -152,6 +211,13 @@
         emulator.add_listener("emulator-started", function()
         {
             booted = true;
+            if(hdd_pending)
+            {
+                // The disk was picked while the machine was still being created.
+                hdd_pending = false;
+                swap_hdd(hdd_file);
+                return;
+            }
             if(!paused)
             {
                 set_status("Работает, ОЗУ гостя: " + started_ram_mib + " МиБ");
@@ -168,8 +234,8 @@
         }
 
         iso_file = file;
-        iso_name.textContent = file.name + " (" + Math.round(file.size / MiB) + " МиБ)";
-        start_btn.disabled = false;
+        iso_name.textContent = file.name + " (" + format_size(file.size) + ")";
+        update_start_gate();
 
         if(emulator)
         {
@@ -186,11 +252,40 @@
         }
     });
 
+    hdd_input.addEventListener("change", function()
+    {
+        var file = hdd_input.files && hdd_input.files[0];
+        if(!file)
+        {
+            return;
+        }
+
+        hdd_file = file;
+        hdd_name.textContent = file.name + " (" + format_size(file.size) + ")";
+        update_start_gate();
+
+        if(emulator && booted)
+        {
+            swap_hdd(file);
+        }
+        else if(emulator)
+        {
+            // The machine is still being created, so its devices do not exist yet.
+            // The disk is inserted as soon as it has started.
+            hdd_pending = true;
+            set_status("Машина запускается, диск будет подключён после старта.");
+        }
+        else
+        {
+            set_status(hdd_file && !iso_file ? "Образ жёсткого диска выбран. Нажмите «Запустить»." : "Образ выбран. Нажмите «Запустить».");
+        }
+    });
+
     start_btn.addEventListener("click", function()
     {
-        if(!iso_file)
+        if(!boot_media_selected())
         {
-            set_status("Сначала выберите ISO-образ.");
+            set_status("Сначала выберите ISO-образ или образ жёсткого диска.");
             return;
         }
 
@@ -329,7 +424,8 @@
     ram_select.value = String(is_small_screen() ? 256 : 512);
 
     set_running_controls(false);
-    set_status("Выберите ISO-образ.");
+    set_status("Выберите ISO-образ или образ жёсткого диска.");
     iso_input.disabled = false;
+    hdd_input.disabled = false;
     ram_select.disabled = false;
 })();

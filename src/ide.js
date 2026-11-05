@@ -295,18 +295,13 @@ export function IDEController(cpu, bus, ide_config)
     this.primary = undefined;
     this.secondary = undefined;
 
-    const has_primary = ide_config && ide_config[0][0];
-    const has_secondary = ide_config && ide_config[1][0];
-    if(has_primary || has_secondary)
+    if(ide_config)
     {
-        if(has_primary)
-        {
-            this.primary = new IDEChannel(this, 0, ide_config[0], 0x1F0, 0x3F6, 14);
-        }
-        if(has_secondary)
-        {
-            this.secondary = new IDEChannel(this, 1, ide_config[1], 0x170, 0x376, 15);
-        }
+        // Both channels always exist, like on a real PIIX3: the drives on them are
+        // optional and can be attached at runtime (see V86.prototype.set_hda). An
+        // interface without media reports no drive to the BIOS.
+        this.primary = new IDEChannel(this, 0, ide_config[0], 0x1F0, 0x3F6, 14);
+        this.secondary = new IDEChannel(this, 1, ide_config[1], 0x170, 0x376, 15);
 
         const vendor_id = 0x8086;    // Intel Corporation
         const device_id = 0x7010;    // 82371SB PIIX3 IDE [Natoma/Triton II]
@@ -314,10 +309,10 @@ export function IDEController(cpu, bus, ide_config)
         const subclass = 0x01;       // IDE Controller
         const prog_if = 0x80;        // ISA Compatibility mode-only controller, supports bus mastering
         const interrupt_line = 0x00; // IRQs 14 and 15 are predefined in Compatibility mode and this field is ignored
-        const command_base0 = has_primary ? this.primary.command_base : 0;
-        const control_base0 = has_primary ? this.primary.control_base : 0;
-        const command_base1 = has_secondary ? this.secondary.command_base : 0;
-        const control_base1 = has_secondary ? this.secondary.control_base : 0;
+        const command_base0 = this.primary.command_base;
+        const control_base0 = this.primary.control_base;
+        const command_base1 = this.secondary.command_base;
+        const control_base1 = this.secondary.control_base;
 
         this.name = "ide";
         this.pci_id = 0x1E << 3;
@@ -350,11 +345,11 @@ export function IDEController(cpu, bus, ide_config)
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         this.pci_bars = [
-            has_primary ? { size: 8 } : undefined,   // BAR0: Command block register address of primary channel
-            has_primary ? { size: 1 } : undefined,   // BAR1: Control block register address of primary channel
-            has_secondary ? { size: 8 } : undefined, // BAR2: Command block register address of secondary channel
-            has_secondary ? { size: 1 } : undefined, // BAR3: Control block register address of secondary channel
-            { size: 16 }                             // BAR4: Bus Master I/O register address of both channels (8+8)
+            { size: 8 },  // BAR0: Command block register address of primary channel
+            { size: 1 },  // BAR1: Control block register address of primary channel
+            { size: 8 },  // BAR2: Command block register address of secondary channel
+            { size: 1 },  // BAR3: Control block register address of secondary channel
+            { size: 16 }  // BAR4: Bus Master I/O register address of both channels (8+8)
         ];
         cpu.devices.pci.register_device(this);
     }
@@ -372,8 +367,10 @@ IDEController.prototype.get_state = function()
 
 IDEController.prototype.set_state = function(state)
 {
-    this.primary && this.primary.set_state(state[0]);
-    this.secondary && this.secondary.set_state(state[1]);
+    // state[0]/state[1] are empty in images of a machine that had no drive on the
+    // channel at the time the image was taken.
+    this.primary && state[0] && this.primary.set_state(state[0]);
+    this.secondary && state[1] && this.secondary.set_state(state[1]);
 };
 
 /**
@@ -1064,6 +1061,9 @@ IDEInterface.prototype.set_disk_buffer = function(buffer)
     }
 
     this.buffer = buffer;
+    // A disk can be inserted at runtime (see V86.prototype.set_hda), so the
+    // interface becomes connected as soon as it has media.
+    this.drive_connected = this.is_atapi || !!buffer;
     if(this.is_atapi)
     {
         this.status_reg = ATA_SR_DRDY|ATA_SR_DSC|ATA_SR_DRQ|ATA_SR_COND;

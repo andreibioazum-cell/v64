@@ -45,7 +45,7 @@ jobs:
 
   site-browser:
     runs-on: ubuntu-latest
-    name: Site in Chrome with 2 GiB guest RAM
+    name: Site in Chrome with 2 GiB guest RAM and a hard disk
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -68,7 +68,7 @@ jobs:
       - name: Install puppeteer-core
         run: npm install --prefix /tmp/browser-test --no-save puppeteer-core@24
 
-      - name: Run site in Chrome with 2048 MiB
+      - name: Run site in Chrome with 2048 MiB, then boot a hard disk
         run: |
           CHROME_PATH="$(command -v google-chrome || command -v chromium-browser || command -v chromium)"
           echo "Chrome: $CHROME_PATH"
@@ -78,8 +78,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: site-2048-screenshot
-          path: build/site-2048.png
+          name: site-screenshots
+          path: |
+            build/site-2048.png
+            build/site-hdd.png
           if-no-files-found: ignore
 
   test:
