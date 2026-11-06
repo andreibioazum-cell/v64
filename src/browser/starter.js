@@ -1067,6 +1067,54 @@ V86.prototype.eject_cdrom = function()
 };
 
 /**
+ * Set the image inserted in the primary master hard disk drive. Can be changed
+ * at runtime, as when physically changing the hard disk. The new geometry is
+ * stored in the CMOS, so the machine picks the disk up on the next boot.
+ */
+V86.prototype.set_hda = async function(file)
+{
+    const ide = this.v86.cpu.devices.ide.primary.master;
+
+    if(file.url && !file.async)
+    {
+        await new Promise(resolve => {
+            load_file(file.url, {
+                done: result =>
+                {
+                    ide.set_disk_buffer(new SyncBuffer(result));
+                    resolve();
+                }
+            });
+        });
+    }
+    else
+    {
+        const image = buffer_from_object(file, this.zstd_decompress_worker.bind(this));
+        const loaded = new Promise(resolve => {
+            image.onload = () =>
+            {
+                // ide needs to read the mbr to calculate the device geometry
+                if(image.byteLength >= 512)
+                {
+                    image.get_and_cache(0, 512, () =>
+                    {
+                        ide.set_disk_buffer(image);
+                        resolve();
+                    });
+                }
+                else
+                {
+                    ide.set_disk_buffer(image);
+                    resolve();
+                }
+            };
+        });
+        await image.load();
+        await loaded;
+    }
+};
+
+/**
  * Send a sequence of scan codes to the emulated PS2 controller. A list of
  * codes can be found at http://stanislavs.org/helppc/make_codes.html.
  * Do nothing if there is no keyboard controller.

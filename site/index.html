@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="x86-64 эмулятор ПК в браузере (v86)">
+<title>v86 · x86-64</title>
+<style>
+:root {
+    color-scheme: dark;
+    --bg: #101113;
+    --panel: #1a1b1e;
+    --fg: #e9e9ea;
+    --muted: #9a9ca3;
+    --border: #3a3c42;
+    --accent: #4f8cff;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--fg); }
+body {
+    font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-text-size-adjust: 100%;
+}
+header, main { max-width: 1100px; margin: 0 auto; padding: 12px 16px; }
+h1 { font-size: 1.25rem; margin: 0 0 4px; }
+.hint { margin: 0; color: var(--muted); }
+
+#screen_container {
+    position: relative;
+    width: 100%;
+    background: #000;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    text-align: center;
+}
+#screen_container > div {
+    color: #ddd;
+    text-align: left;
+    padding: 8px;
+    overflow: auto;
+}
+#screen_container canvas {
+    display: block;
+    margin: 0 auto;
+    max-width: 100%;
+    height: auto;
+    image-rendering: pixelated;
+}
+
+#controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin: 12px 0 8px;
+}
+#iso_name, #hdd_name { color: var(--muted); overflow-wrap: anywhere; flex: 1 1 200px; }
+.clear_file { min-height: 34px; padding: 4px 12px; flex: 0 0 auto; }
+button, .file_button {
+    font: inherit;
+    min-height: 44px;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    color: var(--fg);
+    cursor: pointer;
+    text-align: center;
+}
+.file_button { display: inline-block; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .4; cursor: default; }
+button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+#ram {
+    font: inherit;
+    min-height: 44px;
+    padding: 8px 10px;
+    color: var(--fg);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+#ram:disabled { opacity: .4; }
+.ram_label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+#iso, #hdd { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
+#typing {
+    width: 100%;
+    min-height: 44px;
+    padding: 10px 12px;
+    font: inherit;
+    color: var(--fg);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+#typing:disabled { opacity: .4; }
+.typing_label { display: block; margin: 8px 0 4px; color: var(--muted); font-size: .9em; }
+#status { min-height: 1.4em; margin: 10px 0 0; color: var(--muted); }
+
+#log_panel {
+    margin: 10px 0 0;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #0b0c0e;
+}
+#log_head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    color: var(--muted);
+    font-size: .9em;
+}
+#log_head span { flex: 1 1 auto; }
+#log_head button { min-height: 34px; padding: 4px 10px; font-size: .9em; }
+#log_lines {
+    max-height: 15em;
+    overflow-y: auto;
+    padding: 6px 8px;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+#log_lines:empty::before { content: "пока пусто"; color: #5c5f66; }
+
+#progress {
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    margin: 10px 0 0;
+    padding: 8px 12px 10px;
+    background: rgba(16, 17, 19, .96);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+#progress_track {
+    height: 6px;
+    border-radius: 3px;
+    background: #26282d;
+    overflow: hidden;
+}
+#progress_fill {
+    height: 100%;
+    width: 0;
+    background: var(--accent);
+    transition: width .2s linear;
+}
+#progress_row {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    margin-top: 6px;
+    font-size: .9em;
+    color: var(--muted);
+}
+#progress_percent { min-width: 3.2em; color: var(--fg); font-variant-numeric: tabular-nums; }
+#progress_label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#progress.progress_err #progress_fill { background: #ff6b6b; }
+#progress.progress_err #progress_percent { color: #ff8d8d; }
+#progress.progress_done #progress_fill { background: #4fd97a; }
+.log_line { display: flex; gap: 6px; overflow-wrap: anywhere; }
+.log_time { color: #6b6f76; flex: 0 0 auto; }
+.log_kind { color: #8fa3c8; flex: 0 0 auto; }
+.log_kind::after { content: ":"; }
+.log_text { flex: 1 1 auto; white-space: pre-wrap; }
+.log_err .log_text { color: #ff8d8d; }
+.log_warn .log_text { color: #ffd479; }
+.log_ok .log_text { color: #86e08b; }
+
+@media (max-width: 720px) {
+    body { font-size: 14px; }
+    header, main { padding: 8px 10px; }
+    #controls button, #controls .file_button { flex: 1 1 calc(50% - 8px); }
+    #controls .clear_file { flex: 0 0 auto; }
+    #iso_name, #hdd_name { flex: 1 1 100%; order: -1; }
+}
+</style>
+</head>
+<body>
+<header>
+    <h1>v86 · x86-64</h1>
+    <p class="hint">Эмулятор ПК в браузере. Выберите ISO-образ (например, Alpine Linux x86_64) или образ жёсткого диска (образ раздела/диска целиком, .img/.raw) и запустите. Если выбраны оба, при запуске загрузка идёт с жёсткого диска. Если загрузка не удалась, причина будет в логе под экраном.</p>
+</header>
+
+<main>
+    <div id="screen_container">
+        <div style="white-space: pre; font: 14px monospace; line-height: 14px"></div>
+        <canvas style="display: none"></canvas>
+    </div>
+
+    <div id="controls">
+        <label class="file_button" id="iso_label">Выбрать ISO<input id="iso" type="file" accept=".iso,.img,.raw,application/x-iso9660-image"></label>
+        <span id="iso_name">ISO не выбран</span>
+        <button type="button" class="clear_file" id="iso_clear" title="Убрать выбранный ISO" disabled>×</button>
+        <label class="file_button" id="hdd_label">Выбрать HDD<input id="hdd" type="file" accept=".img,.raw,.hdd,.bin"></label>
+        <span id="hdd_name">жёсткий диск не выбран</span>
+        <button type="button" class="clear_file" id="hdd_clear" title="Убрать выбранный диск" disabled>×</button>
+        <label class="ram_label" for="ram">ОЗУ
+            <select id="ram" disabled>
+                <option value="256">256 МиБ</option>
+                <option value="512">512 МиБ</option>
+                <option value="1024">1024 МиБ</option>
+                <option value="2048">2048 МиБ</option>
+            </select>
+        </label>
+        <button id="start" class="primary" disabled>Запустить</button>
+        <button id="pause" disabled>Пауза</button>
+        <button id="reset" disabled>Перезапуск</button>
+        <button id="cad" disabled>Ctrl+Alt+Del</button>
+        <button id="fullscreen" disabled>На весь экран</button>
+    </div>
+
+    <label class="typing_label" for="typing">Ввод текста (экранная клавиатура телефона)</label>
+    <input id="typing" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" disabled>
+
+    <p id="status">Выберите ISO-образ или образ жёсткого диска.</p>
+
+    <section id="log_panel" aria-label="Лог загрузки">
+        <div id="log_head">
+            <span>Лог: что найдено в образах и что ответил BIOS</span>
+            <button id="log_copy" type="button">Копировать</button>
+            <button id="log_clear" type="button">Очистить</button>
+        </div>
+        <div id="log_lines" role="log" aria-live="polite"></div>
+    </section>
+
+    <div id="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Загрузка">
+        <div id="progress_track"><div id="progress_fill"></div></div>
+        <div id="progress_row">
+            <span id="progress_percent">0%</span>
+            <span id="progress_label">Выберите ISO-образ или образ жёсткого диска</span>
+        </div>
+    </div>
+</main>
+
+<noscript>Для работы эмулятора нужен JavaScript и поддержка WebAssembly.</noscript>
+
+<script>
+/*@LIBV86@*/
+</script>
+<script>
+/*@ASSETS@*/
+/*@APP@*/
+</script>
+</body>
+</html>

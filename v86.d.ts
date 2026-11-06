@@ -721,6 +721,12 @@ export class V86 {
     eject_fdb(): void;
 
     /**
+     * Set the image inserted in the primary master hard disk drive. Can be
+     * changed at runtime, as when physically changing the hard disk.
+     */
+    set_hda(image: V86Image): Promise<void>;
+
+    /**
      * Set the image inserted in the CD-ROM drive. Can be changed at runtime, as
      * when physically changing the CD-ROM.
      */
