@@ -60,6 +60,109 @@
         return Math.max(1, Math.round(bytes / 1024)) + " КиБ";
     }
 
+    // v86 boots the image itself, so the boot sector has to be at offset 0: container
+    // formats (qcow2, VMDK, ...) and non-ISO9660 CD images only fail much later inside
+    // the BIOS, with no hint for the user. The names below make that visible up front.
+    var CONTAINER_FORMATS = {
+        qcow: "qcow/qcow2", qcow2: "qcow/qcow2", qcow3: "qcow/qcow2",
+        vmdk: "VMDK", vdi: "VDI", vhd: "VHD", vhdx: "VHDX",
+    };
+
+    var CONTAINER_MAGICS = [
+        { bytes: [0x51, 0x46, 0x49, 0xFB], name: "qcow/qcow2" },
+        { bytes: [0x4B, 0x44, 0x4D, 0x56], name: "VMDK" },
+        { bytes: [0x7F, 0x10, 0xDA, 0xBE], name: "VDI" },
+        { bytes: [0x63, 0x6F, 0x6E, 0x65, 0x63, 0x74, 0x69, 0x78], name: "VHD" },
+    ];
+
+    function file_extension(name)
+    {
+        var dot = name.lastIndexOf(".");
+        return dot === -1 ? "" : name.slice(dot + 1).toLowerCase();
+    }
+
+    function starts_with(bytes, magic)
+    {
+        if(bytes.length < magic.length)
+        {
+            return false;
+        }
+        for(var i = 0; i < magic.length; i++)
+        {
+            if(bytes[i] !== magic[i])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    function read_head(file, length, callback)
+    {
+        var reader = new FileReader();
+        reader.onload = function(e)
+        {
+            callback(new Uint8Array(e.target.result));
+        };
+        reader.onerror = function()
+        {
+            callback(new Uint8Array(0));
+        };
+        reader.readAsArrayBuffer(file.slice(0, Math.min(length, file.size)));
+    }
+
+    function is_iso9660(head)
+    {
+        return head.length >= 0x8006 &&
+            String.fromCharCode(head[0x8001], head[0x8002], head[0x8003], head[0x8004], head[0x8005]) === "CD001";
+    }
+
+    // Returns a short reason why the BIOS will not boot the image, or "" if it looks usable.
+    function image_problem(file, head, is_cdrom)
+    {
+        var format = CONTAINER_FORMATS[file_extension(file.name)];
+
+        for(var i = 0; i < CONTAINER_MAGICS.length && !format; i++)
+        {
+            if(starts_with(head, CONTAINER_MAGICS[i].bytes))
+            {
+                format = CONTAINER_MAGICS[i].name;
+            }
+        }
+
+        if(format)
+        {
+            return "это образ " + format + ", а v86 читает только raw-образы (нужен .img/.raw, например qemu-img convert -O raw)";
+        }
+
+        if(is_cdrom)
+        {
+            return is_iso9660(head) ? "" :
+                "в образе нет ISO9660 (CD001), BIOS не сможет с него загрузиться";
+        }
+
+        return head.length >= 512 && head[510] === 0x55 && head[511] === 0xAA ? "" :
+            "в первых 512 байтах нет сигнатуры 0x55AA, BIOS не загрузится с этого образа";
+    }
+
+    // Shows the file name and, once the header is read, why it may not boot.
+    function describe_image(file, is_cdrom, name_element)
+    {
+        var label = file.name + " (" + format_size(file.size) + ")";
+        name_element.textContent = label;
+
+        read_head(file, is_cdrom ? 0x8006 : 512, function(head)
+        {
+            if(name_element.textContent !== label)
+            {
+                // Another image was picked in the meantime.
+                return;
+            }
+            var problem = image_problem(file, head, is_cdrom);
+            name_element.textContent = problem ? label + " — " + problem : label;
+        });
+    }
+
     // The machine boots from the hard disk when one is selected, from the CD otherwise,
     // so at least one of the two images is required.
     function boot_media_selected()
@@ -234,7 +337,7 @@
         }
 
         iso_file = file;
-        iso_name.textContent = file.name + " (" + format_size(file.size) + ")";
+        describe_image(file, true, iso_name);
         update_start_gate();
 
         if(emulator)
@@ -261,7 +364,7 @@
         }
 
         hdd_file = file;
-        hdd_name.textContent = file.name + " (" + format_size(file.size) + ")";
+        describe_image(file, false, hdd_name);
         update_start_gate();
 
         if(emulator && booted)

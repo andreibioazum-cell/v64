@@ -153,6 +153,10 @@ async function wait_for_hdd(page, timeout) {
     const hdd = path.join(os.tmpdir(), "site-hdd.img");
     make_hdd_image(hdd);
 
+    // A qcow2 header: such an image cannot be booted, the page has to say so.
+    const qcow = path.join(os.tmpdir(), "site-hdd.qcow2");
+    fs.writeFileSync(qcow, Buffer.concat([Buffer.from("QFI\xFB", "binary"), Buffer.alloc(4096)]));
+
     const browser = await puppeteer.launch({
         executablePath: CHROME,
         headless: true,
@@ -269,6 +273,18 @@ async function wait_for_hdd(page, timeout) {
         if(!start_disabled) fail("#start is enabled before any image is selected");
 
         const hdd_input2 = await page2.$("#hdd");
+        await hdd_input2.uploadFile(qcow);
+        try {
+            await page2.waitForFunction(
+                () => /qcow/.test(document.getElementById("hdd_name").textContent),
+                { timeout: 30000 }
+            );
+            console.log("qcow2 note: " + (await page2.$eval("#hdd_name", (e) => e.textContent)).trim());
+        }
+        catch(err) {
+            fail("a qcow2 image is not called out on the page: " + (await hdd_state(page2)));
+        }
+
         await hdd_input2.uploadFile(hdd);
         await wait_for_start(page2, 30000);
         await page2.click("#start");
