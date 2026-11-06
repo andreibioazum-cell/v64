@@ -31,6 +31,9 @@
     var typing = el("typing");
     var status = el("status");
     var ram_select = el("ram");
+    var log_lines = el("log_lines");
+    var log_copy_btn = el("log_copy");
+    var log_clear_btn = el("log_clear");
 
     function decode_base64(b64)
     {
@@ -62,7 +65,8 @@
 
     // v86 boots the image itself, so the boot sector has to be at offset 0: container
     // formats (qcow2, VMDK, ...) and non-ISO9660 CD images only fail much later inside
-    // the BIOS, with no hint for the user. The names below make that visible up front.
+    // the BIOS, with no hint for the user. Everything that can be decided by reading a
+    // few sectors is written to the log and to the label next to the file button.
     var CONTAINER_FORMATS = {
         qcow: "qcow/qcow2", qcow2: "qcow/qcow2", qcow3: "qcow/qcow2",
         vmdk: "VMDK", vdi: "VDI", vhd: "VHD", vhdx: "VHDX",
@@ -74,6 +78,11 @@
         { bytes: [0x7F, 0x10, 0xDA, 0xBE], name: "VDI" },
         { bytes: [0x63, 0x6F, 0x6E, 0x65, 0x63, 0x74, 0x69, 0x78], name: "VHD" },
     ];
+
+    var LOG_LIMIT = 500;
+
+    var hdd_problem = "";
+    var iso_problem = "";
 
     function file_extension(name)
     {
@@ -97,8 +106,52 @@
         return true;
     }
 
-    function read_head(file, length, callback)
+    function le32(bytes, offset)
     {
+        return ((bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0);
+    }
+
+    function hex2(value)
+    {
+        return (value < 16 ? "0" : "") + value.toString(16).toUpperCase();
+    }
+
+    function has_boot_signature(bytes, offset)
+    {
+        return bytes.length >= offset + 2 && bytes[offset] === 0x55 && bytes[offset + 1] === 0xAA;
+    }
+
+    function has_ascii(bytes, offset, text)
+    {
+        if(bytes.length < offset + text.length)
+        {
+            return false;
+        }
+        for(var i = 0; i < text.length; i++)
+        {
+            if(bytes[offset + i] !== text.charCodeAt(i))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    function is_iso9660(head)
+    {
+        return has_ascii(head, 0x8001, "CD001");
+    }
+
+    function read_range(file, offset, length, callback)
+    {
+        var end = Math.min(offset + length, file.size);
+
+        if(offset >= file.size || end <= offset)
+        {
+            callback(new Uint8Array(0));
+            return;
+        }
+
         var reader = new FileReader();
         reader.onload = function(e)
         {
@@ -108,59 +161,508 @@
         {
             callback(new Uint8Array(0));
         };
-        reader.readAsArrayBuffer(file.slice(0, Math.min(length, file.size)));
+        reader.readAsArrayBuffer(file.slice(offset, end));
     }
 
-    function is_iso9660(head)
+    // The log is what tells the user why a boot failed: what was read from the image
+    // and what the BIOS answered afterwards.
+    function log(kind, text, level)
     {
-        return head.length >= 0x8006 &&
-            String.fromCharCode(head[0x8001], head[0x8002], head[0x8003], head[0x8004], head[0x8005]) === "CD001";
-    }
-
-    // Returns a short reason why the BIOS will not boot the image, or "" if it looks usable.
-    function image_problem(file, head, is_cdrom)
-    {
-        var format = CONTAINER_FORMATS[file_extension(file.name)];
-
-        for(var i = 0; i < CONTAINER_MAGICS.length && !format; i++)
+        if(!log_lines)
         {
-            if(starts_with(head, CONTAINER_MAGICS[i].bytes))
+            return;
+        }
+
+        var line = document.createElement("div");
+        line.className = "log_line" + (level ? " log_" + level : "");
+
+        var time = document.createElement("span");
+        time.className = "log_time";
+        time.textContent = now_stamp();
+
+        var kind_span = document.createElement("span");
+        kind_span.className = "log_kind";
+        kind_span.textContent = kind;
+
+        var text_span = document.createElement("span");
+        text_span.className = "log_text";
+        text_span.textContent = text;
+
+        line.appendChild(time);
+        line.appendChild(kind_span);
+        line.appendChild(text_span);
+        log_lines.appendChild(line);
+
+        while(log_lines.childElementCount > LOG_LIMIT)
+        {
+            log_lines.removeChild(log_lines.firstElementChild);
+        }
+
+        log_lines.scrollTop = log_lines.scrollHeight;
+    }
+
+    function two_digits(value)
+    {
+        return (value < 10 ? "0" : "") + value;
+    }
+
+    function now_stamp()
+    {
+        var date = new Date();
+        return two_digits(date.getHours()) + ":" + two_digits(date.getMinutes()) + ":" + two_digits(date.getSeconds());
+    }
+
+    function log_text_all()
+    {
+        var lines = [];
+
+        if(!log_lines)
+        {
+            return "";
+        }
+
+        for(var i = 0; i < log_lines.childElementCount; i++)
+        {
+            var line = log_lines.children[i];
+            lines.push(
+                line.querySelector(".log_time").textContent + " " +
+                line.querySelector(".log_kind").textContent + ": " +
+                line.querySelector(".log_text").textContent
+            );
+        }
+        return lines.join("\n");
+    }
+
+    function clear_log()
+    {
+        if(log_lines)
+        {
+            log_lines.textContent = "";
+        }
+    }
+
+    function describe_filesystem(sector)
+    {
+        if(has_ascii(sector, 3, "NTFS    "))
+        {
+            return "NTFS";
+        }
+        if(has_ascii(sector, 3, "EXFAT   "))
+        {
+            return "exFAT";
+        }
+        if(has_ascii(sector, 0x52, "FAT32"))
+        {
+            return "FAT32";
+        }
+        if(has_ascii(sector, 0x36, "FAT16") || has_ascii(sector, 0x36, "FAT12"))
+        {
+            return "FAT";
+        }
+        if(sector.length >= 0x43A && sector[0x438] === 0x53 && sector[0x439] === 0xEF)
+        {
+            return "ext2/3/4";
+        }
+        return "";
+    }
+
+    function bootable_partitions(mbr)
+    {
+        var partitions = [];
+        for(var i = 0; i < 4; i++)
+        {
+            var base = 446 + i * 16;
+            var type = mbr[base + 4];
+            if(type)
             {
-                format = CONTAINER_MAGICS[i].name;
+                partitions.push({
+                    index: i + 1,
+                    active: mbr[base] === 0x80,
+                    type: type,
+                    start: le32(mbr, base + 8),
+                    count: le32(mbr, base + 12),
+                });
+            }
+        }
+        return partitions;
+    }
+
+    function report_disk(file, head, done)
+    {
+        var kind = "диск";
+
+        if(head.length < 512)
+        {
+            log(kind, "файл короче 512 байт — загрузочного сектора в нём нет", "err");
+            done("файл короче 512 байт, загрузочного сектора в нём нет");
+            return;
+        }
+
+        if(file.size % 512)
+        {
+            log(kind, "размер " + format_size(file.size) + " не кратен 512 байтам — образ обрезан или это не raw-образ диска", "warn");
+        }
+        else
+        {
+            log(kind, "размер " + format_size(file.size) + ", " + (file.size / 512) + " секторов по 512 байт");
+        }
+
+        if(!has_boot_signature(head, 510))
+        {
+            log(kind, "в первых 512 байтах нет 0x55AA — BIOS ответит «Boot failed: not a bootable disk»", "err");
+
+            if(has_ascii(head, 0x8001, "CD001"))
+            {
+                log(kind, "в секторе 16 лежит ISO9660 — это CD-образ, выберите его кнопкой «Выбрать ISO»", "warn");
+                done("это CD-образ (ISO9660), а не жёсткий диск — выберите его кнопкой «Выбрать ISO»");
+            }
+            else
+            {
+                done("в первых 512 байтах нет сигнатуры 0x55AA, BIOS не загрузится с этого образа");
+            }
+            return;
+        }
+
+        log(kind, "загрузочная сигнатура 0x55AA на месте", "ok");
+
+        if(has_ascii(head, 512, "EFI PART"))
+        {
+            log(kind, "найдена таблица разделов GPT (BIOS читает MBR-часть, см. ниже)");
+        }
+
+        var partitions = bootable_partitions(head);
+
+        if(!partitions.length)
+        {
+            log(kind, "таблица разделов MBR пустая — BIOS загрузит сам MBR", "warn");
+            done("");
+            return;
+        }
+
+        for(var i = 0; i < partitions.length; i++)
+        {
+            var partition = partitions[i];
+            log(kind, "раздел " + partition.index + ": тип 0x" + hex2(partition.type) +
+                ", начало LBA " + partition.start +
+                ", размер " + format_size(partition.count * 512) +
+                (partition.active ? ", помечен активным" : ""));
+        }
+
+        var primary = partitions[0];
+        for(i = 0; i < partitions.length; i++)
+        {
+            if(partitions[i].active)
+            {
+                primary = partitions[i];
+                break;
             }
         }
 
-        if(format)
+        var offset = primary.start * 512;
+
+        if(offset + 512 > file.size)
         {
-            return "это образ " + format + ", а v86 читает только raw-образы (нужен .img/.raw, например qemu-img convert -O raw)";
+            log(kind, "раздел " + primary.index + " начинается по LBA " + primary.start + ", а это за концом файла — образ обрезан", "err");
+            done("таблица разделов указывает за конец файла, образ обрезан");
+            return;
         }
 
-        if(is_cdrom)
+        read_range(file, offset, 512, function(sector)
         {
-            return is_iso9660(head) ? "" :
-                "в образе нет ISO9660 (CD001), BIOS не сможет с него загрузиться";
-        }
+            var filesystem = describe_filesystem(sector);
+            var suffix = filesystem ? " (" + filesystem + ")" : "";
 
-        return head.length >= 512 && head[510] === 0x55 && head[511] === 0xAA ? "" :
-            "в первых 512 байтах нет сигнатуры 0x55AA, BIOS не загрузится с этого образа";
+            if(has_boot_signature(sector, 510))
+            {
+                log(kind, "загрузочная запись раздела " + primary.index + " (LBA " + primary.start + ") содержит 0x55AA" + suffix + " — BIOS сможет загрузиться с раздела", "ok");
+                done("");
+            }
+            else
+            {
+                log(kind, "в загрузочной записи раздела " + primary.index + " (LBA " + primary.start + ") нет 0x55AA" + suffix + " — с него не загрузиться", "err");
+                done("первый сектор раздела без сигнатуры 0x55AA, загрузка не пойдёт");
+            }
+        });
+    }
+
+    function report_cd(file, done)
+    {
+        read_range(file, 0, 0x8006, function(head)
+        {
+            var kind = "CD";
+
+            log(kind, "размер " + format_size(file.size));
+
+            if(!is_iso9660(head))
+            {
+                log(kind, "ISO9660 не найден: в секторе 16 нет «CD001» — BIOS ответит «Boot failed: Could not read from CDROM (code 0004)»", "err");
+                if(has_boot_signature(head, 510))
+                {
+                    log(kind, "зато в первых 512 байтах есть 0x55AA — это образ диска, выберите его кнопкой «Выбрать HDD»", "warn");
+                    done("это образ диска (0x55AA), а не CD — выберите его кнопкой «Выбрать HDD»");
+                }
+                else
+                {
+                    done("в образе нет ISO9660 (CD001), BIOS не сможет с него загрузиться");
+                }
+                return;
+            }
+
+            log(kind, "ISO9660 найден (CD001 в секторе 16; всего " + Math.floor(file.size / 2048) + " секторов по 2048 байт)", "ok");
+
+            read_range(file, 0x8800, 0x800, function(boot_record)
+            {
+                if(has_ascii(boot_record, 7, "EL TORITO SPECIFICATION"))
+                {
+                    var catalog = le32(boot_record, 0x47);
+                    log(kind, "есть загрузочная запись El Torito, каталог загрузки в секторе " + catalog + " — BIOS сможет загрузиться с CD", "ok");
+
+                    if(catalog && catalog * 2048 >= file.size)
+                    {
+                        log(kind, "но каталог загрузки указывает за конец файла — образ обрезан", "err");
+                    }
+                    done("");
+                }
+                else
+                {
+                    log(kind, "нет загрузочной записи El Torito (сектор 17, «EL TORITO SPECIFICATION») — BIOS ответит «Boot failed: Could not read from CDROM (code 0004)»", "err");
+                    done("в образе нет El Torito (загрузочной записи), BIOS не сможет с него загрузиться");
+                }
+            });
+        });
+    }
+
+    // Reads the first sectors of a freshly chosen image, writes the findings to the log
+    // and returns one short reason for the label next to the file button.
+    function report_image(file, is_cdrom, done)
+    {
+        var kind = is_cdrom ? "CD" : "диск";
+        var container = CONTAINER_FORMATS[file_extension(file.name)];
+
+        log(kind, "выбран файл " + file.name + " (" + format_size(file.size) + ", " + file.size + " байт)");
+
+        read_range(file, 0, 1024, function(head)
+        {
+            for(var i = 0; i < CONTAINER_MAGICS.length && !container; i++)
+            {
+                if(starts_with(head, CONTAINER_MAGICS[i].bytes))
+                {
+                    container = CONTAINER_MAGICS[i].name;
+                }
+            }
+
+            if(container)
+            {
+                log(kind, "это контейнер " + container + " (сигнатура в первых байтах) — v86 работает только с raw-образами", "err");
+                log(kind, "файл подключён как есть, поэтому BIOS не увидит ни таблицы разделов, ни загрузочной записи; " +
+                    "переконвертируйте: qemu-img convert -O raw \"" + file.name + "\" disk.img", "warn");
+                done("это образ " + container + ", а v86 читает только raw-образы (нужен .img/.raw, например qemu-img convert -O raw)");
+                return;
+            }
+
+            if(is_cdrom)
+            {
+                report_cd(file, done);
+            }
+            else
+            {
+                report_disk(file, head, done);
+            }
+        });
     }
 
     // Shows the file name and, once the header is read, why it may not boot.
-    function describe_image(file, is_cdrom, name_element)
+    function select_image(file, is_cdrom, name_element)
     {
         var label = file.name + " (" + format_size(file.size) + ")";
+        var current = function()
+        {
+            return is_cdrom ? iso_file : hdd_file;
+        };
+
         name_element.textContent = label;
 
-        read_head(file, is_cdrom ? 0x8006 : 512, function(head)
+        report_image(file, is_cdrom, function(problem)
         {
-            if(name_element.textContent !== label)
+            if(is_cdrom)
+            {
+                iso_problem = problem;
+            }
+            else
+            {
+                hdd_problem = problem;
+            }
+
+            if(current() !== file)
             {
                 // Another image was picked in the meantime.
                 return;
             }
-            var problem = image_problem(file, head, is_cdrom);
             name_element.textContent = problem ? label + " — " + problem : label;
         });
+    }
+
+    function verdict_text()
+    {
+        var reasons = [];
+
+        if(hdd_file && hdd_problem)
+        {
+            reasons.push("жёсткий диск «" + hdd_file.name + "»: " + hdd_problem);
+        }
+        if(iso_file && iso_problem)
+        {
+            reasons.push("CD «" + iso_file.name + "»: " + iso_problem);
+        }
+
+        if(!reasons.length)
+        {
+            return "ни один носитель не загрузочный; в образах нет явных проблем — возможно, в них нет загрузчика или он падает";
+        }
+
+        return "ни один носитель не загрузочный — " + reasons.join("; ");
+    }
+
+    // The BIOS prints why it could not boot, but only as its own terse messages.
+    // Watching the text screen lets the page repeat those lines in the log and add the
+    // explanation for each of them.
+    var bios_timer = null;
+    var bios_rows = [];
+    var bios_logged = {};
+
+    var BIOS_LINE = /^(SeaBIOS|Booting from|Boot failed|No bootable|Could not read|Retrying|Press |iPXE|Escape|error:|Error:)/;
+
+    function stop_bios_watch()
+    {
+        if(bios_timer)
+        {
+            clearInterval(bios_timer);
+            bios_timer = null;
+        }
+    }
+
+    function start_bios_watch()
+    {
+        stop_bios_watch();
+        bios_rows = [];
+        bios_logged = {};
+
+        bios_timer = setInterval(function()
+        {
+            var adapter = emulator && emulator.screen_adapter;
+
+            if(!adapter || typeof adapter.get_text_screen !== "function")
+            {
+                return;
+            }
+
+            var rows;
+
+            try
+            {
+                rows = adapter.get_text_screen();
+            }
+            catch(err)
+            {
+                return;
+            }
+
+            for(var i = 0; i < rows.length; i++)
+            {
+                var line = (rows[i] || "").replace(/\s+$/, "");
+
+                if(line === bios_rows[i])
+                {
+                    continue;
+                }
+                bios_rows[i] = line;
+
+                var trimmed = line.replace(/^\s+/, "");
+                if(trimmed && BIOS_LINE.test(trimmed))
+                {
+                    log_bios_line(trimmed);
+                }
+            }
+        }, 300);
+    }
+
+    function log_bios_line(text)
+    {
+        var now = Date.now();
+
+        // The same message is re-rendered when the screen scrolls; do not repeat it.
+        if(bios_logged[text] && now - bios_logged[text] < 2000)
+        {
+            return;
+        }
+        bios_logged[text] = now;
+
+        log("BIOS", text);
+
+        var note = explain_bios_line(text);
+        if(note)
+        {
+            log("BIOS", "→ " + note, "err");
+        }
+
+        if(/^No bootable device/.test(text))
+        {
+            log("итог", verdict_text(), "err");
+        }
+    }
+
+    function explain_bios_line(text)
+    {
+        if(/Boot failed: not a bootable disk/.test(text))
+        {
+            return "жёсткий диск не загрузочный: в его первом секторе нет корректной загрузочной записи (0x55AA)";
+        }
+        if(/Boot failed: could not read the boot disk/.test(text))
+        {
+            return "флоппи-диска нет или он не читается — это не ошибка выбранного образа";
+        }
+        if(/Boot failed: Could not read from CDROM/.test(text))
+        {
+            return "BIOS не нашёл на CD загрузочную запись El Torito — с этого образа загрузиться нельзя";
+        }
+        if(/^Booting from Hard Disk/.test(text))
+        {
+            return "BIOS передаёт управление загрузочной записи диска";
+        }
+        if(/^Booting from DVD\/CD/.test(text))
+        {
+            return "BIOS пробует CD: ищет El Torito/ISO9660";
+        }
+        if(/^Booting from Floppy/.test(text))
+        {
+            return "BIOS пробует флоппи: там нет носителя";
+        }
+        return "";
+    }
+
+    function log_boot_order()
+    {
+        var media = [];
+
+        if(hdd_file)
+        {
+            media.push("жёсткий диск («" + hdd_file.name + "»)");
+        }
+        if(iso_file)
+        {
+            media.push("CD-ROM («" + iso_file.name + "»)");
+        }
+        if(!media.length)
+        {
+            return;
+        }
+
+        log("запуск", "порядок загрузки: " + media.join(" → "));
+
+        if(hdd_file && iso_file)
+        {
+            log("запуск", "BIOS попробует жёсткий диск первым, CD — только если диск не загрузочный");
+        }
     }
 
     // The machine boots from the hard disk when one is selected, from the CD otherwise,
@@ -241,6 +743,7 @@
         ram_select.disabled = false;
         start_btn.disabled = false;
         set_running_controls(false);
+        log("машина", "ошибка запуска: " + message, "err");
         set_status("Ошибка запуска: " + message + ". Выберите меньший объём ОЗУ и запустите снова.");
     }
 
@@ -249,6 +752,7 @@
     function swap_hdd(file)
     {
         set_status("Загрузка образа жёсткого диска…");
+        log("диск", "подключаю «" + file.name + "» на место жёсткого диска и перезагружаюсь");
         emulator.set_hda({ buffer: file }).then(function()
         {
             if(!emulator)
@@ -256,6 +760,7 @@
                 return;
             }
             emulator.restart();
+            start_bios_watch();
             if(paused)
             {
                 // The machine was paused; a reboot does not resume it by itself.
@@ -266,7 +771,9 @@
             set_running_controls(true);
         }, function(err)
         {
-            set_status("Ошибка чтения образа жёсткого диска: " + (err && err.message ? err.message : String(err)));
+            var message = err && err.message ? err.message : String(err);
+            log("диск", "не удалось подключить образ: " + message, "err");
+            set_status("Ошибка чтения образа жёсткого диска: " + message);
         });
     }
 
@@ -311,9 +818,12 @@
             disable_speaker: true,
         });
 
+        log("машина", "старт: ОЗУ гостя " + ram_mib + " МиБ");
+
         emulator.add_listener("emulator-started", function()
         {
             booted = true;
+            start_bios_watch();
             if(hdd_pending)
             {
                 // The disk was picked while the machine was still being created.
@@ -337,14 +847,16 @@
         }
 
         iso_file = file;
-        describe_image(file, true, iso_name);
+        select_image(file, true, iso_name);
         update_start_gate();
 
         if(emulator)
         {
             // Load the new image into the running machine and reboot from it.
+            log("CD", "подключаю «" + file.name + "» в CD-ROM и перезагружаюсь");
             emulator.set_cdrom({ buffer: file });
             emulator.restart();
+            start_bios_watch();
             paused = false;
             set_status("Перезапуск с нового образа");
             set_running_controls(true);
@@ -364,7 +876,7 @@
         }
 
         hdd_file = file;
-        describe_image(file, false, hdd_name);
+        select_image(file, false, hdd_name);
         update_start_gate();
 
         if(emulator && booted)
@@ -393,6 +905,8 @@
         }
 
         start_btn.disabled = true;
+        log_boot_order();
+
         if(!emulator)
         {
             start_with_ram(selected_ram_mib());
@@ -419,6 +933,44 @@
         }
     });
 
+    if(log_clear_btn)
+    {
+        log_clear_btn.addEventListener("click", clear_log);
+    }
+
+    if(log_copy_btn)
+    {
+        log_copy_btn.addEventListener("click", function()
+        {
+            var text = log_text_all();
+
+            if(navigator.clipboard && navigator.clipboard.writeText)
+            {
+                navigator.clipboard.writeText(text).catch(function()
+                {
+                    set_status("Не удалось скопировать лог — выделите его мышью");
+                });
+                return;
+            }
+
+            var area = document.createElement("textarea");
+            area.value = text;
+            document.body.appendChild(area);
+            area.select();
+
+            try
+            {
+                document.execCommand("copy");
+            }
+            catch(err)
+            {
+                set_status("Не удалось скопировать лог — выделите его мышью");
+            }
+
+            document.body.removeChild(area);
+        });
+    }
+
     ram_select.addEventListener("change", function()
     {
         set_status(ram_warning() || "ОЗУ гостя: " + selected_ram_mib() + " МиБ. Изменить можно после перезагрузки страницы.");
@@ -430,6 +982,7 @@
     {
         var reason = e.reason;
         var message = reason && reason.message ? reason.message : String(reason);
+        log("ошибка", message, "err");
         if(emulator && !booted)
         {
             on_start_failed(message);
@@ -467,7 +1020,9 @@
         {
             return;
         }
+        log("машина", "перезагрузка по кнопке");
         emulator.restart();
+        start_bios_watch();
         paused = false;
         set_status("Перезапуск");
         set_running_controls(true);
