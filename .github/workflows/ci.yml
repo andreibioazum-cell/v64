@@ -42,3 +42,10 @@ jobs:
           rustc --version
           make all
           make build/v86-fallback.wasm
+
+      - name: Upload index.html
+        uses: actions/upload-artifact@v4
+        with:
+          name: index.html
+          path: build/index.html
+          if-no-files-found: error
