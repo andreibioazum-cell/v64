@@ -116,6 +116,16 @@
         return (value < 16 ? "0" : "") + value.toString(16).toUpperCase();
     }
 
+    function hex_dump(bytes, offset, length)
+    {
+        var out = [];
+        for(var i = 0; i < length && offset + i < bytes.length; i++)
+        {
+            out.push(hex2(bytes[offset + i]));
+        }
+        return out.join(" ");
+    }
+
     function has_boot_signature(bytes, offset)
     {
         return bytes.length >= offset + 2 && bytes[offset] === 0x55 && bytes[offset + 1] === 0xAA;
@@ -324,6 +334,35 @@
         }
 
         log(kind, "загрузочная сигнатура 0x55AA на месте", "ok");
+        log(kind, "первые 16 байт загрузочного сектора: " + hex_dump(head, 0, 16));
+
+        var code_bytes = 0;
+        for(i = 0; i < 510; i++)
+        {
+            if(head[i])
+            {
+                code_bytes++;
+            }
+        }
+
+        if(code_bytes === 0)
+        {
+            log(kind, "в загрузочном секторе нет кода: все 510 байт — нули, BIOS передаст управление пустому сектору, и машина зависнет без вывода", "err");
+            done("загрузочный сектор пустой (нули), загружаться нечему");
+            return;
+        }
+
+        if(code_bytes > 480 && head[0] === 0xFF)
+        {
+            log(kind, "загрузочный сектор заполнен 0xFF — кода в нём нет, BIOS передаст управление мусору", "err");
+            done("загрузочный сектор заполнен 0xFF, загружаться нечему");
+            return;
+        }
+
+        if(head[0] === 0x00)
+        {
+            log(kind, "первый байт загрузочного сектора — 0x00: это не начало кода, скорее всего сектор не загрузочный", "warn");
+        }
 
         if(has_ascii(head, 512, "EFI PART"))
         {
@@ -334,7 +373,18 @@
 
         if(!partitions.length)
         {
-            log(kind, "таблица разделов MBR пустая — BIOS загрузит сам MBR", "warn");
+            var filesystem = describe_filesystem(head);
+
+            if(filesystem)
+            {
+                log(kind, "таблица разделов MBR пустая, зато в секторе 0 лежит " + filesystem +
+                    " — это superfloppy-образ без таблицы разделов, BIOS загрузит сектор 0 как есть");
+            }
+            else
+            {
+                log(kind, "таблица разделов MBR пустая и знакомой файловой системы в секторе 0 нет — " +
+                    "если у образа своя схема разметки, это нормально, иначе он вряд ли загрузочный", "warn");
+            }
             done("");
             return;
         }
@@ -532,12 +582,31 @@
 
     var BIOS_LINE = /^(SeaBIOS|Booting from|Boot failed|No bootable|Could not read|Retrying|Press |iPXE|Escape|error:|Error:)/;
 
+    // The BIOS says "Booting from ..." and then nothing at all: either the guest is
+    // working silently (graphics mode, or just quiet) or its boot code is stuck in a
+    // loop. Telling the user which one it is saves them from a blank screen.
+    var HANG_SECONDS = 10;
+
+    var handoff_time = 0;
+    var hang_reported = false;
+    var serial_line = "";
+    var serial_lines = 0;
+    var SERIAL_LINES_LIMIT = 200;
+    var graphical_mode = false;
+    var last_screen_change = 0;
+    var hang_timer = null;
+
     function stop_bios_watch()
     {
         if(bios_timer)
         {
             clearInterval(bios_timer);
             bios_timer = null;
+        }
+        if(hang_timer)
+        {
+            clearInterval(hang_timer);
+            hang_timer = null;
         }
     }
 
@@ -546,6 +615,11 @@
         stop_bios_watch();
         bios_rows = [];
         bios_logged = {};
+        handoff_time = 0;
+        hang_reported = false;
+        graphical_mode = false;
+        serial_line = "";
+        last_screen_change = Date.now();
 
         bios_timer = setInterval(function()
         {
@@ -577,6 +651,8 @@
                 }
                 bios_rows[i] = line;
 
+                last_screen_change = Date.now();
+
                 var trimmed = line.replace(/^\s+/, "");
                 if(trimmed && BIOS_LINE.test(trimmed))
                 {
@@ -584,6 +660,59 @@
                 }
             }
         }, 300);
+
+        hang_timer = setInterval(check_hang, 1000);
+    }
+
+    // Hobby systems usually print their progress to COM1 instead of the screen.
+    function on_serial_byte(byte)
+    {
+        if(serial_lines >= SERIAL_LINES_LIMIT)
+        {
+            return;
+        }
+
+        if(byte === 10 || byte === 13)
+        {
+            var text = serial_line.replace(/\s+$/, "");
+            serial_line = "";
+
+            if(text)
+            {
+                serial_lines++;
+                log("COM1", text);
+                last_screen_change = Date.now();
+            }
+            return;
+        }
+
+        if(byte >= 32 && byte < 127 && serial_line.length < 300)
+        {
+            serial_line += String.fromCharCode(byte);
+            last_screen_change = Date.now();
+        }
+    }
+
+    function check_hang()
+    {
+        if(!emulator || !handoff_time || hang_reported || graphical_mode)
+        {
+            return;
+        }
+
+        var silent = Math.round((Date.now() - last_screen_change) / 1000);
+
+        if(silent < HANG_SECONDS)
+        {
+            return;
+        }
+
+        hang_reported = true;
+
+        log("BIOS", "гость принял управление " + silent + " с назад и не вывел ничего нового — загрузочный код, похоже, завис " +
+            "(нет ни вывода, ни перезагрузки)", "warn");
+        log("итог", "машина жива, но делает что-то молча. Если образ должен что-то показать, дело в его загрузочном секторе: " +
+            "смотрите дамп первых байт выше — пустой сектор (нули) или код, который ждёт ключа/чтения с диска, выглядят именно так", "warn");
     }
 
     function log_bios_line(text)
@@ -596,6 +725,19 @@
             return;
         }
         bios_logged[text] = now;
+
+        if(/^Booting from (Hard Disk|DVD\/CD|Floppy)/.test(text))
+        {
+            // The BIOS is about to jump into the boot code of that medium.
+            handoff_time = Date.now();
+            last_screen_change = handoff_time;
+            hang_reported = false;
+        }
+        else if(/^(Boot failed|No bootable device)/.test(text))
+        {
+            // Not a handoff after all: the BIOS keeps trying other media.
+            handoff_time = 0;
+        }
 
         log("BIOS", text);
 
@@ -819,6 +961,14 @@
         });
 
         log("машина", "старт: ОЗУ гостя " + ram_mib + " МиБ");
+
+        emulator.add_listener("serial0-output-byte", on_serial_byte);
+
+        // Text mode reports [cols, rows, 0], graphics [width, height, bpp].
+        emulator.add_listener("screen-set-size", function(args)
+        {
+            graphical_mode = !!(args && args[2]);
+        });
 
         emulator.add_listener("emulator-started", function()
         {
