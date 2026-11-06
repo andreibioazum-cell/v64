@@ -1186,7 +1186,11 @@ IDEInterface.prototype.ata_command = function(cmd)
 {
     if(!this.drive_connected && cmd !== ATA_CMD_EXECUTE_DEVICE_DIAGNOSTIC)
     {
-        dbg_log(`${this.name}: ATA command ${ATA_CMD_NAME[cmd]} (${h(cmd)}) ignored: no slave drive connected`, LOG_DISK);
+        // A channel without a drive has to answer: a guest that probes the interface
+        // (the BIOS does that on every boot) waits for the interrupt of its command,
+        // and staying silent makes every probe take as long as the guest's timeout.
+        dbg_log(`${this.name}: ATA command ${ATA_CMD_NAME[cmd]} (${h(cmd)}) aborted: no drive connected`, LOG_DISK);
+        this.ata_abort_command();
         return;
     }
 
