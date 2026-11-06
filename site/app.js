@@ -34,6 +34,8 @@
     var log_lines = el("log_lines");
     var log_copy_btn = el("log_copy");
     var log_clear_btn = el("log_clear");
+    var iso_clear_btn = el("iso_clear");
+    var hdd_clear_btn = el("hdd_clear");
 
     function decode_base64(b64)
     {
@@ -83,6 +85,7 @@
 
     var hdd_problem = "";
     var iso_problem = "";
+    var hdd_stub = false;
 
     function file_extension(name)
     {
@@ -251,6 +254,29 @@
         }
     }
 
+    // Some images ship with a placeholder boot sector that simply spins. The BIOS
+    // accepts it as a bootable disk, so the screen just stops with no error at all.
+    function describe_boot_code(head)
+    {
+        if(head[0] === 0xEB && head[1] === 0xFE)
+        {
+            return "`jmp $` (EB FE): бесконечный переход на самое себя";
+        }
+        if(head[0] === 0xE9 && head[1] === 0xFD && head[2] === 0xFF)
+        {
+            return "`jmp $` (E9 FD FF): бесконечный переход на самое себя";
+        }
+        if(head[0] === 0xFA && head[1] === 0xF4)
+        {
+            return "`cli` + `hlt` (FA F4): прерывания выключены, процессор остановлен";
+        }
+        if(head[0] === 0xF4)
+        {
+            return "`hlt` (F4): процессор останавливается сразу";
+        }
+        return "";
+    }
+
     function describe_filesystem(sector)
     {
         if(has_ascii(sector, 3, "NTFS    "))
@@ -335,6 +361,17 @@
 
         log(kind, "загрузочная сигнатура 0x55AA на месте", "ok");
         log(kind, "первые 16 байт загрузочного сектора: " + hex_dump(head, 0, 16));
+
+        var stub = describe_boot_code(head);
+
+        if(stub)
+        {
+            hdd_stub = true;
+            log(kind, "в загрузочном секторе заглушка — " + stub + ". BIOS передаст ей управление, " +
+                "и машина остановится без вывода и без ошибки", "err");
+            done("загрузочный сектор — заглушка `jmp $`, загружаться нечему");
+            return;
+        }
 
         var code_bytes = 0;
         for(i = 0; i < 510; i++)
@@ -532,6 +569,12 @@
 
         name_element.textContent = label;
 
+        if(!is_cdrom)
+        {
+            // The verdict below replaces whatever the previous image was.
+            hdd_stub = false;
+        }
+
         report_image(file, is_cdrom, function(problem)
         {
             if(is_cdrom)
@@ -550,6 +593,38 @@
             }
             name_element.textContent = problem ? label + " — " + problem : label;
         });
+    }
+
+    function clear_media(is_cdrom)
+    {
+        if(emulator)
+        {
+            log(is_cdrom ? "CD" : "диск",
+                "образ уже подключён к запущенной машине — чтобы сменить или убрать его, перезагрузите страницу", "warn");
+            return;
+        }
+
+        if(is_cdrom)
+        {
+            iso_file = null;
+            iso_problem = "";
+            iso_input.value = "";
+            iso_name.textContent = "ISO не выбран";
+            iso_clear_btn.disabled = true;
+        }
+        else
+        {
+            hdd_file = null;
+            hdd_problem = "";
+            hdd_stub = false;
+            hdd_input.value = "";
+            hdd_name.textContent = "жёсткий диск не выбран";
+            hdd_clear_btn.disabled = true;
+        }
+
+        log(is_cdrom ? "CD" : "диск", "выбор образа сброшен");
+        update_start_gate();
+        set_status(boot_media_selected() ? "Образ выбран. Нажмите «Запустить»." : "Выберите ISO-образ или образ жёсткого диска.");
     }
 
     function verdict_text()
@@ -711,8 +786,15 @@
 
         log("BIOS", "гость принял управление " + silent + " с назад и не вывел ничего нового — загрузочный код, похоже, завис " +
             "(нет ни вывода, ни перезагрузки)", "warn");
-        log("итог", "машина жива, но делает что-то молча. Если образ должен что-то показать, дело в его загрузочном секторе: " +
-            "смотрите дамп первых байт выше — пустой сектор (нули) или код, который ждёт ключа/чтения с диска, выглядят именно так", "warn");
+        if(hdd_problem || iso_problem)
+        {
+            log("итог", verdict_text(), "err");
+        }
+        else
+        {
+            log("итог", "машина жива, но делает что-то молча. Если образ должен что-то показать, дело в его загрузочном секторе: " +
+                "смотрите дамп первых байт выше — код, который ждёт ключа или чтения с диска, выглядит именно так", "warn");
+        }
     }
 
     function log_bios_line(text)
@@ -804,6 +886,12 @@
         if(hdd_file && iso_file)
         {
             log("запуск", "BIOS попробует жёсткий диск первым, CD — только если диск не загрузочный");
+        }
+
+        if(hdd_file && iso_file && hdd_stub)
+        {
+            log("запуск", "в загрузочном секторе диска заглушка, поэтому до CD дело не дойдёт — " +
+                "если нужен CD, уберите диск крестиком рядом с его именем", "warn");
         }
     }
 
@@ -998,6 +1086,7 @@
 
         iso_file = file;
         select_image(file, true, iso_name);
+        iso_clear_btn.disabled = false;
         update_start_gate();
 
         if(emulator)
@@ -1027,6 +1116,7 @@
 
         hdd_file = file;
         select_image(file, false, hdd_name);
+        hdd_clear_btn.disabled = false;
         update_start_gate();
 
         if(emulator && booted)
@@ -1086,6 +1176,22 @@
     if(log_clear_btn)
     {
         log_clear_btn.addEventListener("click", clear_log);
+    }
+
+    if(iso_clear_btn)
+    {
+        iso_clear_btn.addEventListener("click", function()
+        {
+            clear_media(true);
+        });
+    }
+
+    if(hdd_clear_btn)
+    {
+        hdd_clear_btn.addEventListener("click", function()
+        {
+            clear_media(false);
+        });
     }
 
     if(log_copy_btn)
