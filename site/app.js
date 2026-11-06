@@ -36,6 +36,10 @@
     var log_clear_btn = el("log_clear");
     var iso_clear_btn = el("iso_clear");
     var hdd_clear_btn = el("hdd_clear");
+    var progress_el = el("progress");
+    var progress_fill = el("progress_fill");
+    var progress_percent_el = el("progress_percent");
+    var progress_label_el = el("progress_label");
 
     function decode_base64(b64)
     {
@@ -65,6 +69,103 @@
         return Math.max(1, Math.round(bytes / 1024)) + " КиБ";
     }
 
+    // The bar under the page shows how far the boot got: reading the images, starting
+    // the machine, the BIOS hand-off, and then the guest itself.
+    function set_progress(percent, label, level)
+    {
+        progress_value = Math.max(0, Math.min(100, Math.round(percent)));
+
+        if(progress_fill)
+        {
+            progress_fill.style.width = progress_value + "%";
+        }
+        if(progress_percent_el)
+        {
+            progress_percent_el.textContent = progress_value + "%";
+        }
+        if(progress_label_el)
+        {
+            progress_label_el.textContent = label || "";
+            progress_label_el.title = label || "";
+        }
+        if(progress_el)
+        {
+            progress_el.classList.toggle("progress_err", level === "err");
+            progress_el.classList.toggle("progress_done", level === "done");
+            progress_el.setAttribute("aria-valuenow", String(progress_value));
+        }
+    }
+
+    // Milestones can arrive out of order (restarts, late listeners); never go back.
+    function raise_progress(percent, label, level)
+    {
+        if(percent > progress_value)
+        {
+            set_progress(percent, label, level);
+        }
+    }
+
+    function short_failure()
+    {
+        var reasons = [];
+
+        if(hdd_file && hdd_problem)
+        {
+            reasons.push("диск «" + hdd_file.name + "»: " + hdd_problem);
+        }
+        if(iso_file && iso_problem)
+        {
+            reasons.push("CD «" + iso_file.name + "»: " + iso_problem);
+        }
+
+        return reasons.length ? reasons.join("; ") : "BIOS не нашёл загрузочный носитель";
+    }
+
+    // v86 reads the whole image into memory for files below 256 MiB anyway, but without
+    // any feedback. Doing it here shows real percentages instead of a frozen page.
+    function read_file_with_progress(file, on_progress)
+    {
+        return new Promise(function(resolve, reject)
+        {
+            var buffer = new ArrayBuffer(file.size);
+            var view = new Uint8Array(buffer);
+            var offset = 0;
+
+            function next()
+            {
+                if(offset >= file.size)
+                {
+                    resolve(buffer);
+                    return;
+                }
+
+                var end = Math.min(offset + READ_CHUNK, file.size);
+                var reader = new FileReader();
+
+                reader.onload = function(e)
+                {
+                    view.set(new Uint8Array(e.target.result), offset);
+                    offset = end;
+                    on_progress(offset, file.size);
+                    next();
+                };
+                reader.onerror = function()
+                {
+                    reject(new Error("не удалось прочитать «" + file.name + "»"));
+                };
+                reader.readAsArrayBuffer(file.slice(offset, end));
+            }
+
+            if(file.size === 0)
+            {
+                resolve(buffer);
+                return;
+            }
+
+            next();
+        });
+    }
+
     // v86 boots the image itself, so the boot sector has to be at offset 0: container
     // formats (qcow2, VMDK, ...) and non-ISO9660 CD images only fail much later inside
     // the BIOS, with no hint for the user. Everything that can be decided by reading a
@@ -86,6 +187,14 @@
     var hdd_problem = "";
     var iso_problem = "";
     var hdd_stub = false;
+    var hdd_data = null;
+    var iso_data = null;
+    var progress_value = 0;
+
+    // Images up to this size are read into memory by the page itself, so the bar can
+    // show how much of the file is loaded. Bigger ones are streamed by v86.
+    var READ_LIMIT = 256 * MiB;
+    var READ_CHUNK = 4 * MiB;
 
     function file_extension(name)
     {
@@ -569,10 +678,15 @@
 
         name_element.textContent = label;
 
-        if(!is_cdrom)
+        if(is_cdrom)
+        {
+            iso_data = null;
+        }
+        else
         {
             // The verdict below replaces whatever the previous image was.
             hdd_stub = false;
+            hdd_data = null;
         }
 
         report_image(file, is_cdrom, function(problem)
@@ -592,6 +706,15 @@
                 return;
             }
             name_element.textContent = problem ? label + " — " + problem : label;
+
+            if(problem)
+            {
+                set_progress(progress_value, "образ не загрузочный — " + problem, "err");
+            }
+            else if(!emulator)
+            {
+                set_progress(0, "Образ готов. Нажмите «Запустить»");
+            }
         });
     }
 
@@ -608,6 +731,7 @@
         {
             iso_file = null;
             iso_problem = "";
+            iso_data = null;
             iso_input.value = "";
             iso_name.textContent = "ISO не выбран";
             iso_clear_btn.disabled = true;
@@ -617,6 +741,7 @@
             hdd_file = null;
             hdd_problem = "";
             hdd_stub = false;
+            hdd_data = null;
             hdd_input.value = "";
             hdd_name.textContent = "жёсткий диск не выбран";
             hdd_clear_btn.disabled = true;
@@ -624,6 +749,7 @@
 
         log(is_cdrom ? "CD" : "диск", "выбор образа сброшен");
         update_start_gate();
+        set_progress(0, boot_media_selected() ? "Образ готов. Нажмите «Запустить»" : "Выберите ISO-образ или образ жёсткого диска");
         set_status(boot_media_selected() ? "Образ выбран. Нажмите «Запустить»." : "Выберите ISO-образ или образ жёсткого диска.");
     }
 
@@ -733,6 +859,11 @@
                 {
                     log_bios_line(trimmed);
                 }
+                else if(trimmed && handoff_time)
+                {
+                    // Something other than the BIOS is printing: the guest got going.
+                    raise_progress(100, "гость работает — идёт загрузка ОС", "done");
+                }
             }
         }, 300);
 
@@ -757,6 +888,7 @@
                 serial_lines++;
                 log("COM1", text);
                 last_screen_change = Date.now();
+                raise_progress(100, "гость работает — идёт загрузка ОС", "done");
             }
             return;
         }
@@ -786,6 +918,8 @@
 
         log("BIOS", "гость принял управление " + silent + " с назад и не вывел ничего нового — загрузочный код, похоже, завис " +
             "(нет ни вывода, ни перезагрузки)", "warn");
+        set_progress(progress_value, "не грузится — загрузочный код молчит после передачи управления", "err");
+        set_status("Не грузится — загрузочный код молчит после передачи управления");
         if(hdd_problem || iso_problem)
         {
             log("итог", verdict_text(), "err");
@@ -814,12 +948,15 @@
             handoff_time = Date.now();
             last_screen_change = handoff_time;
             hang_reported = false;
+            raise_progress(75, "BIOS передал управление загрузочному сектору");
         }
         else if(/^(Boot failed|No bootable device)/.test(text))
         {
             // Not a handoff after all: the BIOS keeps trying other media.
             handoff_time = 0;
         }
+
+        raise_progress(60, "BIOS загружается");
 
         log("BIOS", text);
 
@@ -832,6 +969,8 @@
         if(/^No bootable device/.test(text))
         {
             log("итог", verdict_text(), "err");
+            set_progress(progress_value, "не грузится — " + short_failure(), "err");
+            set_status("Не грузится — " + short_failure());
         }
     }
 
@@ -974,6 +1113,7 @@
         start_btn.disabled = false;
         set_running_controls(false);
         log("машина", "ошибка запуска: " + message, "err");
+        set_progress(progress_value, "ошибка запуска: " + message, "err");
         set_status("Ошибка запуска: " + message + ". Выберите меньший объём ОЗУ и запустите снова.");
     }
 
@@ -983,6 +1123,7 @@
     {
         set_status("Загрузка образа жёсткого диска…");
         log("диск", "подключаю «" + file.name + "» на место жёсткого диска и перезагружаюсь");
+        set_progress(50, "подключаю образ диска и перезагружаюсь");
         emulator.set_hda({ buffer: file }).then(function()
         {
             if(!emulator)
@@ -1004,6 +1145,82 @@
             var message = err && err.message ? err.message : String(err);
             log("диск", "не удалось подключить образ: " + message, "err");
             set_status("Ошибка чтения образа жёсткого диска: " + message);
+        });
+    }
+
+    // Reads whatever images are not in memory yet (with percentages in the bar) and
+    // then starts the machine.
+    function after_start()
+    {
+        if(!emulator)
+        {
+            return;
+        }
+        paused = false;
+        set_status("Работает" + (ram_warning() ? ". " + ram_warning() : ""));
+        set_running_controls(true);
+    }
+
+    function start_machine()
+    {
+        var pending = [];
+        var total = 0;
+
+        if(hdd_file && !hdd_data && hdd_file.size <= READ_LIMIT)
+        {
+            pending.push({ file: hdd_file, kind: "диск", assign: function(buffer) { hdd_data = buffer; } });
+            total += hdd_file.size;
+        }
+        if(iso_file && !iso_data && iso_file.size <= READ_LIMIT)
+        {
+            pending.push({ file: iso_file, kind: "CD", assign: function(buffer) { iso_data = buffer; } });
+            total += iso_file.size;
+        }
+
+        if(!pending.length)
+        {
+            set_progress(25, "образы готовы, запускаю машину");
+            start_with_ram(selected_ram_mib());
+            after_start();
+            return;
+        }
+
+        var loaded_total = 0;
+        var chain = Promise.resolve();
+
+        set_progress(0, "чтение образов");
+
+        pending.forEach(function(item)
+        {
+            chain = chain.then(function()
+            {
+                set_progress(total ? loaded_total / total * 25 : 0,
+                    "чтение «" + item.file.name + "» (" + format_size(item.file.size) + ")");
+
+                return read_file_with_progress(item.file, function(loaded)
+                {
+                    set_progress((loaded_total + loaded) / total * 25,
+                        "чтение «" + item.file.name + "»: " + format_size(loaded) + " из " + format_size(item.file.size));
+                }).then(function(buffer)
+                {
+                    item.assign(buffer);
+                    loaded_total += item.file.size;
+                    log(item.kind, "образ «" + item.file.name + "» прочитан в память (" + format_size(item.file.size) + ")");
+                });
+            });
+        });
+
+        chain.then(function()
+        {
+            set_progress(25, "образы прочитаны, запускаю машину");
+            start_with_ram(selected_ram_mib());
+            after_start();
+        }, function(err)
+        {
+            var message = err && err.message ? err.message : String(err);
+            log("ошибка", message, "err");
+            set_progress(progress_value, "не удалось прочитать образ: " + message, "err");
+            on_start_failed(message);
         });
     }
 
@@ -1042,13 +1259,14 @@
             // The hard disk goes first in the boot order when it is present; the
             // CD-ROM must be omitted entirely (not set to a null buffer) so that a
             // hard-disk-only start works.
-            hda: hdd_file ? { buffer: hdd_file } : undefined,
-            cdrom: iso_file ? { buffer: iso_file } : undefined,
+            hda: hdd_data ? { buffer: hdd_data } : (hdd_file ? { buffer: hdd_file } : undefined),
+            cdrom: iso_data ? { buffer: iso_data } : (iso_file ? { buffer: iso_file } : undefined),
             autostart: true,
             disable_speaker: true,
         });
 
         log("машина", "старт: ОЗУ гостя " + ram_mib + " МиБ");
+        set_progress(40, "машина запущена, BIOS стартует");
 
         emulator.add_listener("serial0-output-byte", on_serial_byte);
 
@@ -1056,12 +1274,18 @@
         emulator.add_listener("screen-set-size", function(args)
         {
             graphical_mode = !!(args && args[2]);
+
+            if(graphical_mode)
+            {
+                raise_progress(100, "гость работает — идёт загрузка ОС", "done");
+            }
         });
 
         emulator.add_listener("emulator-started", function()
         {
             booted = true;
             start_bios_watch();
+            raise_progress(50, "машина запущена, BIOS стартует");
             if(hdd_pending)
             {
                 // The disk was picked while the machine was still being created.
@@ -1149,14 +1373,8 @@
 
         if(!emulator)
         {
-            start_with_ram(selected_ram_mib());
-            // A synchronous failure has already set the error status and cleared emulator.
-            if(emulator)
-            {
-                paused = false;
-                set_status("Работает" + (ram_warning() ? ". " + ram_warning() : ""));
-                set_running_controls(true);
-            }
+            // Reading the images is asynchronous, so the machine starts a few ticks later.
+            start_machine();
             return;
         }
 
@@ -1239,6 +1457,7 @@
         var reason = e.reason;
         var message = reason && reason.message ? reason.message : String(reason);
         log("ошибка", message, "err");
+        set_progress(progress_value, "ошибка: " + message, "err");
         if(emulator && !booted)
         {
             on_start_failed(message);
@@ -1277,6 +1496,7 @@
             return;
         }
         log("машина", "перезагрузка по кнопке");
+        set_progress(55, "перезагрузка");
         emulator.restart();
         start_bios_watch();
         paused = false;
@@ -1338,6 +1558,7 @@
     ram_select.value = String(is_small_screen() ? 256 : 512);
 
     set_running_controls(false);
+    set_progress(0, "Выберите ISO-образ или образ жёсткого диска");
     set_status("Выберите ISO-образ или образ жёсткого диска.");
     iso_input.disabled = false;
     hdd_input.disabled = false;

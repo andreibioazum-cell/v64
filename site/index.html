@@ -123,6 +123,42 @@ button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accen
     font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 #log_lines:empty::before { content: "пока пусто"; color: #5c5f66; }
+
+#progress {
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    margin: 10px 0 0;
+    padding: 8px 12px 10px;
+    background: rgba(16, 17, 19, .96);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+#progress_track {
+    height: 6px;
+    border-radius: 3px;
+    background: #26282d;
+    overflow: hidden;
+}
+#progress_fill {
+    height: 100%;
+    width: 0;
+    background: var(--accent);
+    transition: width .2s linear;
+}
+#progress_row {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    margin-top: 6px;
+    font-size: .9em;
+    color: var(--muted);
+}
+#progress_percent { min-width: 3.2em; color: var(--fg); font-variant-numeric: tabular-nums; }
+#progress_label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#progress.progress_err #progress_fill { background: #ff6b6b; }
+#progress.progress_err #progress_percent { color: #ff8d8d; }
+#progress.progress_done #progress_fill { background: #4fd97a; }
 .log_line { display: flex; gap: 6px; overflow-wrap: anywhere; }
 .log_time { color: #6b6f76; flex: 0 0 auto; }
 .log_kind { color: #8fa3c8; flex: 0 0 auto; }
@@ -188,6 +224,14 @@ button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accen
         </div>
         <div id="log_lines" role="log" aria-live="polite"></div>
     </section>
+
+    <div id="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Загрузка">
+        <div id="progress_track"><div id="progress_fill"></div></div>
+        <div id="progress_row">
+            <span id="progress_percent">0%</span>
+            <span id="progress_label">Выберите ISO-образ или образ жёсткого диска</span>
+        </div>
+    </div>
 </main>
 
 <noscript>Для работы эмулятора нужен JavaScript и поддержка WebAssembly.</noscript>
