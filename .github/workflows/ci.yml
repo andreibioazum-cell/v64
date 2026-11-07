@@ -49,3 +49,36 @@ jobs:
           name: index.html
           path: build/index.html
           if-no-files-found: error
+
+  atapi-check:
+    name: ATAPI check (temporary)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js version
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.17.0'
+
+      - name: Setup toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add wasm32-unknown-unknown
+
+      - name: Build debug wasm
+        run: make build/v86-debug.wasm
+
+      - name: Download images
+        run: |
+          mkdir -p images
+          curl --compressed --output images/linux4.iso https://i.copy.sh/linux4.iso
+          curl --compressed --output images/msdos622.img https://i.copy.sh/msdos622.img
+
+      - name: boot linux and read the CD
+        run: ./tests/api/iso9660.js
+
+      - name: insert and eject a CD
+        run: ./tests/api/cdrom-insert-eject.js
