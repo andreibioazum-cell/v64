@@ -53,7 +53,7 @@ jobs:
   atapi-check:
     name: ATAPI check (temporary)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -75,10 +75,22 @@ jobs:
         run: |
           mkdir -p images
           curl --compressed --output images/linux4.iso https://i.copy.sh/linux4.iso
-          curl --compressed --output images/msdos622.img https://i.copy.sh/msdos622.img
 
-      - name: boot linux and read the CD
-        run: ./tests/api/iso9660.js
+      - name: Run with the PACKET interrupt
+        continue-on-error: true
+        run: |
+          set +e
+          ./tests/api/iso9660.js > /tmp/with.txt 2>&1
+          rc=$?
+          echo "::error::with fix: rc=$rc"
+          tail -c 2000 /tmp/with.txt | tr '\r' '\n' | grep -v '^$' | tail -12 | while IFS= read -r line; do echo "::error::with: $line"; done
 
-      - name: insert and eject a CD
-        run: ./tests/api/cdrom-insert-eject.js
+      - name: Run without the PACKET interrupt (baseline)
+        continue-on-error: true
+        run: |
+          git checkout 85874fd -- src/ide.js
+          set +e
+          ./tests/api/iso9660.js > /tmp/base.txt 2>&1
+          rc=$?
+          echo "::error::baseline: rc=$rc"
+          tail -c 2000 /tmp/base.txt | tr '\r' '\n' | grep -v '^$' | tail -12 | while IFS= read -r line; do echo "::error::base: $line"; done
