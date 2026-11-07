@@ -40,6 +40,8 @@
     var progress_fill = el("progress_fill");
     var progress_percent_el = el("progress_percent");
     var progress_label_el = el("progress_label");
+    var turbo_input = el("turbo");
+    var turbo_label = el("turbo_label");
 
     function decode_base64(b64)
     {
@@ -105,6 +107,68 @@
         }
     }
 
+    // "Супер-ускорение": the maximum the page can give a guest — the biggest guest RAM,
+    // SeaBIOS fastboot (skips part of the POST), ACPI tables for modern systems, JIT, and
+    // the images read into memory up front instead of being streamed from the file.
+    function turbo_enabled()
+    {
+        return !!(turbo_input && turbo_input.checked);
+    }
+
+    function max_ram_mib()
+    {
+        var max = 0;
+
+        for(var i = 0; i < ram_select.options.length; i++)
+        {
+            max = Math.max(max, parseInt(ram_select.options[i].value, 10) || 0);
+        }
+        return max || 2048;
+    }
+
+    function apply_turbo()
+    {
+        var on = turbo_enabled();
+
+        if(turbo_label)
+        {
+            turbo_label.classList.toggle("turbo_on", on);
+        }
+
+        if(!emulator)
+        {
+            if(on && !turbo_ram_mib)
+            {
+                turbo_ram_mib = selected_ram_mib();
+                ram_select.value = String(max_ram_mib());
+                ram_select.disabled = true;
+            }
+            else if(!on && turbo_ram_mib)
+            {
+                ram_select.value = String(turbo_ram_mib);
+                ram_select.disabled = false;
+                turbo_ram_mib = 0;
+            }
+        }
+
+        if(emulator)
+        {
+            log("машина", "супер-ускорение " + (on ? "включено" : "выключено") + " — применится после перезагрузки страницы", "warn");
+            set_status("Супер-ускорение " + (on ? "включено" : "выключено") + ": применится после перезагрузки страницы");
+            return;
+        }
+
+        if(on)
+        {
+            log("машина", "супер-ускорение: ОЗУ гостя " + max_ram_mib() + " МиБ, JIT, SeaBIOS fastboot, ACPI, образы читаются в память целиком");
+            set_status("Супер-ускорение: " + max_ram_mib() + " МиБ ОЗУ, JIT, fastboot, ACPI");
+        }
+        else
+        {
+            set_status("Выберите ISO-образ или образ жёсткого диска.");
+        }
+    }
+
     function short_failure()
     {
         var reasons = [];
@@ -127,8 +191,21 @@
     {
         return new Promise(function(resolve, reject)
         {
-            var buffer = new ArrayBuffer(file.size);
-            var view = new Uint8Array(buffer);
+            var buffer;
+            var view;
+
+            try
+            {
+                buffer = new ArrayBuffer(file.size);
+                view = new Uint8Array(buffer);
+            }
+            catch(err)
+            {
+                // Not enough memory to hold the image: let v86 stream it instead.
+                resolve(null);
+                return;
+            }
+
             var offset = 0;
 
             function next()
@@ -190,10 +267,13 @@
     var hdd_data = null;
     var iso_data = null;
     var progress_value = 0;
+    var turbo_ram_mib = 0;
 
-    // Images up to this size are read into memory by the page itself, so the bar can
-    // show how much of the file is loaded. Bigger ones are streamed by v86.
-    var READ_LIMIT = 256 * MiB;
+    // Images up to this size are read into memory by the page itself: that gives real
+    // percentages and, more importantly, synchronous reads while the guest boots (v86
+    // streams bigger files block by block, which is very slow for a 1.5 GiB CD).
+    // If the allocation fails, the file is streamed instead.
+    var READ_LIMIT = 2 * 1024 * MiB;
     var READ_CHUNK = 4 * MiB;
 
     function file_extension(name)
@@ -916,19 +996,10 @@
 
         hang_reported = true;
 
-        log("BIOS", "гость принял управление " + silent + " с назад и не вывел ничего нового — загрузочный код, похоже, завис " +
-            "(нет ни вывода, ни перезагрузки)", "warn");
-        set_progress(progress_value, "не грузится — загрузочный код молчит после передачи управления", "err");
-        set_status("Не грузится — загрузочный код молчит после передачи управления");
-        if(hdd_problem || iso_problem)
-        {
-            log("итог", verdict_text(), "err");
-        }
-        else
-        {
-            log("итог", "машина жива, но делает что-то молча. Если образ должен что-то показать, дело в его загрузочном секторе: " +
-                "смотрите дамп первых байт выше — код, который ждёт ключа или чтения с диска, выглядит именно так", "warn");
-        }
+        // Not an error: the guest can be busy reading a big image and print nothing while
+        // it does. Only the log mentions the silence, the bar stays where it is.
+        log("BIOS", "гость принял управление " + silent + " с назад и ничего не печатает — либо он занят чтением с диска " +
+            "(большой образ грузится медленно), либо загрузочный код завис", "warn");
     }
 
     function log_bios_line(text)
@@ -1109,7 +1180,7 @@
             return;
         }
 
-        ram_select.disabled = false;
+        ram_select.disabled = turbo_enabled();
         start_btn.disabled = false;
         set_running_controls(false);
         log("машина", "ошибка запуска: " + message, "err");
@@ -1166,12 +1237,14 @@
         var pending = [];
         var total = 0;
 
-        if(hdd_file && !hdd_data && hdd_file.size <= READ_LIMIT)
+        var read_limit = turbo_enabled() ? Infinity : READ_LIMIT;
+
+        if(hdd_file && !hdd_data && hdd_file.size <= read_limit)
         {
             pending.push({ file: hdd_file, kind: "диск", assign: function(buffer) { hdd_data = buffer; } });
             total += hdd_file.size;
         }
-        if(iso_file && !iso_data && iso_file.size <= READ_LIMIT)
+        if(iso_file && !iso_data && iso_file.size <= read_limit)
         {
             pending.push({ file: iso_file, kind: "CD", assign: function(buffer) { iso_data = buffer; } });
             total += iso_file.size;
@@ -1203,9 +1276,17 @@
                         "чтение «" + item.file.name + "»: " + format_size(loaded) + " из " + format_size(item.file.size));
                 }).then(function(buffer)
                 {
-                    item.assign(buffer);
                     loaded_total += item.file.size;
-                    log(item.kind, "образ «" + item.file.name + "» прочитан в память (" + format_size(item.file.size) + ")");
+
+                    if(buffer)
+                    {
+                        item.assign(buffer);
+                        log(item.kind, "образ «" + item.file.name + "» прочитан в память (" + format_size(item.file.size) + ")");
+                    }
+                    else
+                    {
+                        log(item.kind, "образ «" + item.file.name + "» не влез в память — читаю по требованию, загрузка будет медленнее", "warn");
+                    }
                 });
             });
         });
@@ -1254,6 +1335,11 @@
             screen_container: el("screen_container"),
             memory_size: ram_mib * MiB,
             vga_memory_size: 8 * MiB,
+            // Maximum speed on request: JIT is on by default, fastboot skips part of the
+            // SeaBIOS POST and ACPI tables let modern systems skip their own workarounds.
+            disable_jit: turbo_enabled() ? false : undefined,
+            fastboot: turbo_enabled(),
+            acpi: turbo_enabled(),
             bios: { buffer: seabios.buffer },
             vga_bios: { buffer: vgabios.buffer },
             // The hard disk goes first in the boot order when it is present; the
@@ -1265,7 +1351,8 @@
             disable_speaker: true,
         });
 
-        log("машина", "старт: ОЗУ гостя " + ram_mib + " МиБ");
+        log("машина", "старт: ОЗУ гостя " + ram_mib + " МиБ" +
+            (turbo_enabled() ? ", супер-ускорение: JIT, fastboot, ACPI" : ""));
         set_progress(40, "машина запущена, BIOS стартует");
 
         emulator.add_listener("serial0-output-byte", on_serial_byte);
@@ -1394,6 +1481,11 @@
     if(log_clear_btn)
     {
         log_clear_btn.addEventListener("click", clear_log);
+    }
+
+    if(turbo_input)
+    {
+        turbo_input.addEventListener("change", apply_turbo);
     }
 
     if(iso_clear_btn)

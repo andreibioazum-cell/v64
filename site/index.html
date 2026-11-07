@@ -83,6 +83,20 @@ button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accen
 }
 #ram:disabled { opacity: .4; }
 .ram_label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+.turbo_label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 44px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    color: var(--fg);
+    cursor: pointer;
+}
+.turbo_label input { width: 20px; height: 20px; accent-color: var(--accent); }
+.turbo_label.turbo_on { border-color: var(--accent); color: #fff; }
 #iso, #hdd { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 
 #typing {
@@ -203,6 +217,10 @@ button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accen
                 <option value="1024">1024 МиБ</option>
                 <option value="2048">2048 МиБ</option>
             </select>
+        </label>
+        <label class="turbo_label" id="turbo_label" for="turbo">
+            <input type="checkbox" id="turbo">
+            Супер-ускорение
         </label>
         <button id="start" class="primary" disabled>Запустить</button>
         <button id="pause" disabled>Пауза</button>
