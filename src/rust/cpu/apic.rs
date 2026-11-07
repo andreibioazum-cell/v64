@@ -1,6 +1,6 @@
 // See Intel's System Programming Guide
 
-use crate::cpu::{cpu::js, global_pointers::acpi_enabled, ioapic};
+use crate::cpu::{cpu::js, global_pointers::apic_enabled, ioapic};
 use std::sync::{Mutex, MutexGuard};
 
 const APIC_LOG_VERBOSE: bool = false;
@@ -109,7 +109,9 @@ pub fn get_apic() -> MutexGuard<'static, Apic> { APIC.try_lock().unwrap() }
 pub fn get_apic_addr() -> u32 { &raw mut *get_apic() as u32 }
 
 pub fn read32(addr: u32) -> u32 {
-    if unsafe { !*acpi_enabled } {
+    // The local APIC is alive unless the guest disabled it via
+    // IA32_APIC_BASE.EN (it is enabled at reset, like real hardware)
+    if unsafe { !*apic_enabled } {
         return 0;
     }
     read32_internal(&mut get_apic(), addr)
@@ -276,7 +278,7 @@ fn read32_internal(apic: &mut Apic, addr: u32) -> u32 {
 }
 
 pub fn write32(addr: u32, value: u32) {
-    if unsafe { !*acpi_enabled } {
+    if unsafe { !*apic_enabled } {
         return;
     }
     write32_internal(&mut get_apic(), addr, value)
@@ -464,7 +466,12 @@ fn write32_internal(apic: &mut Apic, addr: u32, value: u32) {
 }
 
 #[no_mangle]
-pub fn apic_timer(now: f64) -> f64 { timer(&mut get_apic(), now) }
+pub fn apic_timer(now: f64) -> f64 {
+    if unsafe { !*apic_enabled } {
+        return 100.0;
+    }
+    timer(&mut get_apic(), now)
+}
 
 fn timer(apic: &mut Apic, now: f64) -> f64 {
     if apic.timer_initial_count == 0 || apic.timer_current_count == 0 {
@@ -555,7 +562,7 @@ fn deliver(apic: &mut Apic, vector: u8, mode: u8, is_level: bool) {
     }
 
     if mode == IOAPIC_DELIVERY_NMI {
-        // TODO
+        unsafe { crate::cpu::cpu::raise_nmi() };
         return;
     }
 

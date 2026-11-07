@@ -63,9 +63,15 @@ function gen_read_imm_call(op, size_variant)
                 {
                     return wrap_imm_call("read_imm16()");
                 }
+                else if(op.imm3264 && size === 64)
+                {
+                    // mov r64, imm64 (0xB8+ with REX.W)
+                    return wrap_imm_call("read_imm64s()");
+                }
                 else
                 {
-                    assert(op.imm1632 && size === 32 || op.imm32);
+                    // note: in 64-bit mode imm32 is sign-extended by the instruction
+                    assert(op.imm1632 && (size === 32 || size === 64) || op.imm32);
                     return wrap_imm_call("read_imm32s()");
                 }
             }
@@ -268,7 +274,7 @@ function gen_instruction_body_after_fixed_g(encoding, size)
 
             return [].concat(
                 instruction_prefix,
-                gen_call(instruction_name, ["modrm_byte & 7", "modrm_byte >> 3 & 7"]),
+                gen_call(instruction_name, ["modrm_byte & 7 | rex_b()", "modrm_byte >> 3 & 7 | rex_r()"]),
                 instruction_postfix
             );
         }
@@ -283,15 +289,22 @@ function gen_instruction_body_after_fixed_g(encoding, size)
             }
             else
             {
-                mem_args = ["match modrm_resolve(modrm_byte) { Ok(a) => a, Err(()) => return }"];
+                // number of immediate bytes after modrm/sib/disp, needed for
+                // RIP-relative addressing in 64-bit mode
+                let imm_len = 0;
+                if(encoding.imm8 || encoding.imm8s || encoding.extra_imm8) imm_len += 1;
+                if(encoding.imm16 || encoding.extra_imm16) imm_len += 2;
+                if(encoding.imm1632) imm_len += size === 16 ? 2 : 4;
+                if(encoding.imm32) imm_len += 4;
+                mem_args = [`match modrm_resolve(modrm_byte, ${imm_len}) { Ok(a) => a, Err(()) => return }`];
             }
 
-            const reg_args = ["modrm_byte & 7"];
+            const reg_args = ["modrm_byte & 7 | rex_b()"];
 
             if(encoding.fixed_g === undefined)
             {
-                mem_args.push("modrm_byte >> 3 & 7");
-                reg_args.push("modrm_byte >> 3 & 7");
+                mem_args.push("modrm_byte >> 3 & 7 | rex_r()");
+                reg_args.push("modrm_byte >> 3 & 7 | rex_r()");
             }
 
             if(imm_read)
@@ -390,11 +403,15 @@ function gen_table()
                 conditions: [`0x${opcode_high_hex}`],
                 body: gen_instruction_body(encoding, 32),
             });
+            cases.push({
+                conditions: [`0x${hex(opcode | 0x200, 2)}`],
+                body: gen_instruction_body(encoding, 64),
+            });
         }
         else
         {
             cases.push({
-                conditions: [`0x${opcode_hex}`, `0x${opcode_high_hex}`],
+                conditions: [`0x${opcode_hex}`, `0x${opcode_high_hex}`, `0x${hex(opcode | 0x200, 2)}`],
                 body: gen_instruction_body(encoding, undefined),
             });
         }
@@ -407,17 +424,28 @@ function gen_table()
             body: ["assert!(false);"]
         },
     };
+
+    // opcodes whose operand size defaults to 64 bit in long mode, even
+    // without a REX.W prefix (push/pop/call/ret/...). The 0x66 prefix
+    // switches them to 16 bit.
+    const d64_opcodes = Object.keys(by_opcode)
+        .filter(o => by_opcode[o][0].d64)
+        .map(o => `0x${hex(+o & 0xFF, 2)}`);
+
     if(to_generate.interpreter)
     {
         const code = [
             "#![cfg_attr(rustfmt, rustfmt_skip)]",
 
             "use crate::cpu::cpu::{after_block_boundary, modrm_resolve};",
-            "use crate::cpu::cpu::{read_imm8, read_imm8s, read_imm16, read_imm32s, read_moffs};",
+            "use crate::cpu::cpu::{read_imm8, read_imm8s, read_imm16, read_imm32s, read_imm64s, read_moffs};",
+            "use crate::cpu::cpu::{rex_b, rex_r};",
             "use crate::cpu::cpu::{task_switch_test, trigger_ud};",
             "use crate::cpu::instructions;",
             "use crate::cpu::global_pointers::{instruction_pointer, prefixes};",
             "use crate::prefix;",
+
+            `pub fn is_default_64_operand_size(opcode: u32) -> bool { matches!(opcode, ${d64_opcodes.join(" | ")}) }`,
 
             "pub unsafe fn run(opcode: u32) {",
             table,
@@ -451,11 +479,15 @@ function gen_table()
                 conditions: [`0x${opcode_high_hex}`],
                 body: gen_instruction_body(encoding, 32),
             });
+            cases0f.push({
+                conditions: [`0x${hex(opcode | 0x200, 2)}`],
+                body: gen_instruction_body(encoding, 64),
+            });
         }
         else
         {
             let block = {
-                conditions: [`0x${opcode_hex}`, `0x${opcode_high_hex}`],
+                conditions: [`0x${opcode_hex}`, `0x${opcode_high_hex}`, `0x${hex(opcode | 0x200, 2)}`],
                 body: gen_instruction_body(encoding, undefined),
             };
             cases0f.push(block);
@@ -471,6 +503,10 @@ function gen_table()
         },
     };
 
+    const d64_opcodes0f = Object.keys(by_opcode0f)
+        .filter(o => by_opcode0f[o][0].d64)
+        .map(o => `0x${hex(+o & 0xFF, 2)}`);
+
     if(to_generate.interpreter0f)
     {
         const code = [
@@ -478,10 +514,13 @@ function gen_table()
 
             "use crate::cpu::cpu::{after_block_boundary, modrm_resolve};",
             "use crate::cpu::cpu::{read_imm8, read_imm16, read_imm32s};",
+            "use crate::cpu::cpu::{rex_b, rex_r};",
             "use crate::cpu::cpu::{task_switch_test, task_switch_test_mmx, trigger_ud};",
             "use crate::cpu::instructions_0f;",
             "use crate::cpu::global_pointers::{instruction_pointer, prefixes};",
             "use crate::prefix;",
+
+            `pub fn is_default_64_operand_size(opcode: u32) -> bool { matches!(opcode, ${d64_opcodes0f.join(" | ")}) }`,
 
             "pub unsafe fn run(opcode: u32) {",
             table0f,

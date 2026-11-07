@@ -47,8 +47,8 @@ function gen_read_imm_call(op, size_variant)
         {
             if(op.immaddr)
             {
-                // immaddr: depends on address size
-                return "cpu.read_moffs()";
+                // immaddr: depends on address size (8 bytes in 64-bit mode)
+                return "cpu.read_moffs64()";
             }
             else
             {
@@ -58,9 +58,14 @@ function gen_read_imm_call(op, size_variant)
                 {
                     return "cpu.read_imm16()";
                 }
+                else if(op.imm3264 && size === 64)
+                {
+                    // mov r64, imm64 (0xB8+ with REX.W)
+                    return "cpu.read_imm64()";
+                }
                 else
                 {
-                    assert(op.imm1632 && size === 32 || op.imm32);
+                    assert(op.imm1632 && (size === 32 || size === 64) || op.imm32);
                     return "cpu.read_imm32()";
                 }
             }
@@ -226,9 +231,35 @@ function gen_instruction_body_after_fixed_g(encoding, size)
     else if(
         encoding.block_boundary &&
         // jump_offset_imm: Is a block boundary, but gets a different type (Jump) below
-        !encoding.jump_offset_imm || (!encoding.custom && encoding.e))
+        !encoding.jump_offset_imm)
     {
-        instruction_postfix.push("analysis.ty = analysis::AnalysisType::BlockBoundary;");
+        if(encoding.not_block_boundary_in_64)
+        {
+            instruction_postfix.push({
+                type: "if-else",
+                if_blocks: [{
+                    condition: "!cpu.is_64()",
+                    body: ["analysis.ty = analysis::AnalysisType::BlockBoundary;"],
+                }],
+            });
+        }
+        else
+        {
+            instruction_postfix.push("analysis.ty = analysis::AnalysisType::BlockBoundary;");
+        }
+    }
+    else if(!encoding.custom && encoding.e)
+    {
+        // The 32-bit jit ends blocks after instructions that it runs through the interpreter
+        // (they may raise exceptions directly). The 64-bit jit checks for that after each
+        // instruction instead.
+        instruction_postfix.push({
+            type: "if-else",
+            if_blocks: [{
+                condition: "!cpu.is_64()",
+                body: ["analysis.ty = analysis::AnalysisType::BlockBoundary;"],
+            }],
+        });
     }
 
     if(encoding.no_next_instruction)
@@ -314,6 +345,8 @@ function gen_instruction_body_after_fixed_g(encoding, size)
             if(encoding.jump_offset_imm)
             {
                 body.push("let jump_offset = " + imm_read + ";");
+                // in 64-bit mode, jumps with 64-bit operand size don't wrap
+                const is_32 = size === 64 ? "true" : "cpu.osize_32()";
 
                 if(encoding.conditional_jump)
                 {
@@ -323,11 +356,11 @@ function gen_instruction_body_after_fixed_g(encoding, size)
                         (encoding.opcode & ~0x3) === 0xE0
                     );
                     const condition_index = encoding.opcode & 0xFF;
-                    body.push(`analysis.ty = analysis::AnalysisType::Jump { offset: jump_offset as i32, condition: Some(0x${hex(condition_index, 2)}), is_32: cpu.osize_32() };`);
+                    body.push(`analysis.ty = analysis::AnalysisType::Jump { offset: jump_offset as i32, condition: Some(0x${hex(condition_index, 2)}), is_32: ${is_32} };`);
                 }
                 else
                 {
-                    body.push(`analysis.ty = analysis::AnalysisType::Jump { offset: jump_offset as i32, condition: None, is_32: cpu.osize_32() };`);
+                    body.push(`analysis.ty = analysis::AnalysisType::Jump { offset: jump_offset as i32, condition: None, is_32: ${is_32} };`);
                 }
             }
             else
@@ -396,11 +429,15 @@ function gen_table()
                 conditions: [`0x${opcode_high_hex}`],
                 body: gen_instruction_body(encoding, 32),
             });
+            cases.push({
+                conditions: [`0x${hex(opcode | 0x200, 2)}`],
+                body: gen_instruction_body(encoding, 64),
+            });
         }
         else
         {
             cases.push({
-                conditions: [`0x${opcode_hex}`, `0x${opcode_high_hex}`],
+                conditions: [`0x${opcode_hex}`, `0x${opcode_high_hex}`, `0x${hex(opcode | 0x200, 2)}`],
                 body: gen_instruction_body(encoding, undefined),
             });
         }
@@ -453,11 +490,15 @@ function gen_table()
                 conditions: [`0x${opcode_high_hex}`],
                 body: gen_instruction_body(encoding, 32),
             });
+            cases0f.push({
+                conditions: [`0x${hex(opcode | 0x200, 2)}`],
+                body: gen_instruction_body(encoding, 64),
+            });
         }
         else
         {
             let block = {
-                conditions: [`0x${opcode_hex}`, `0x${opcode_high_hex}`],
+                conditions: [`0x${opcode_hex}`, `0x${opcode_high_hex}`, `0x${hex(opcode | 0x200, 2)}`],
                 body: gen_instruction_body(encoding, undefined),
             };
             cases0f.push(block);

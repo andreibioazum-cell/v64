@@ -1,13 +1,13 @@
 use crate::cpu::cpu::*;
 use crate::cpu::global_pointers::mxcsr;
 
-pub unsafe fn mov_r_m64(addr: i32, r: i32) {
+pub unsafe fn mov_r_m64(addr: u64, r: i32) {
     // mov* m64, mm
     let data = read_mmx64s(r);
     return_on_pagefault!(safe_write64(addr, data));
     transition_fpu_to_mmx();
 }
-pub unsafe fn movl_r128_m64(addr: i32, r: i32) {
+pub unsafe fn movl_r128_m64(addr: u64, r: i32) {
     // mov* m64, xmm
     let data = read_xmm64s(r);
     return_on_pagefault!(safe_write64(addr, data));
@@ -17,7 +17,7 @@ pub unsafe fn mov_r_r128(r1: i32, r2: i32) {
     let data = read_xmm128s(r2);
     write_xmm_reg128(r1, data);
 }
-pub unsafe fn mov_r_m128(addr: i32, r: i32) {
+pub unsafe fn mov_r_m128(addr: u64, r: i32) {
     // mov* m128, xmm
     let data = read_xmm128s(r);
     return_on_pagefault!(safe_write128(addr, data));
@@ -26,7 +26,7 @@ pub unsafe fn mov_rm_r128(source: reg128, r: i32) {
     // mov* xmm, xmm/m128
     write_xmm_reg128(r, source);
 }
-pub unsafe fn movh_r128_m64(addr: i32, r: i32) {
+pub unsafe fn movh_r128_m64(addr: u64, r: i32) {
     // movhp* m64, xmm
     let data = read_xmm128s(r);
     return_on_pagefault!(safe_write64(addr, data.u64[1]));
@@ -336,6 +336,53 @@ pub unsafe fn sse_convert_f64_to_i32(x: f64) -> i32 {
     else {
         // TODO: Signal
         return -0x80000000;
+    };
+}
+
+// 64-bit destination variants of the above (cvttsd2si r64 etc. in long mode);
+// the "integer indefinite" value on failure is i64::MIN
+#[no_mangle]
+pub unsafe fn sse_convert_with_truncation_f32_to_i64(x: f32) -> i64 {
+    let x = x.trunc();
+    if x >= -9223372036854775808.0 && x < 9223372036854775808.0 {
+        return x as i64;
+    }
+    else {
+        // TODO: Signal
+        return i64::MIN;
+    };
+}
+#[no_mangle]
+pub unsafe fn sse_convert_f32_to_i64(x: f32) -> i64 {
+    let x = sse_integer_round(x as f64);
+    if x >= -9223372036854775808.0 && x < 9223372036854775808.0 {
+        return x as i64;
+    }
+    else {
+        // TODO: Signal
+        return i64::MIN;
+    };
+}
+#[no_mangle]
+pub unsafe fn sse_convert_with_truncation_f64_to_i64(x: f64) -> i64 {
+    let x = x.trunc();
+    if x >= -9223372036854775808.0 && x < 9223372036854775808.0 {
+        return x as i64;
+    }
+    else {
+        // TODO: Signal
+        return i64::MIN;
+    };
+}
+#[no_mangle]
+pub unsafe fn sse_convert_f64_to_i64(x: f64) -> i64 {
+    let x = sse_integer_round(x);
+    if x >= -9223372036854775808.0 && x < 9223372036854775808.0 {
+        return x as i64;
+    }
+    else {
+        // TODO: Signal
+        return i64::MIN;
     };
 }
 
