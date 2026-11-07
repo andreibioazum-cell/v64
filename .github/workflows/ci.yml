@@ -50,58 +50,100 @@ jobs:
           path: build/index.html
           if-no-files-found: error
 
-  atapi-check:
-    name: ATAPI check (temporary)
+  atapi-a:
+    name: ATAPI A current ide.js
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 40
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
-
+        with:
+          fetch-depth: 0
       - name: Setup Node.js version
         uses: actions/setup-node@v6
         with:
           node-version: '24.17.0'
-
       - name: Setup toolchain
         run: |
           rustup toolchain install stable --profile minimal
           rustup target add wasm32-unknown-unknown
-
       - name: Build debug wasm
         run: make build/v86-debug.wasm
-
       - name: Download image
         run: |
           mkdir -p images
           curl -L --fail --silent --show-error -o images/linux4.iso https://i.copy.sh/linux4.iso
-          echo "::error::size=$(stat -c %s images/linux4.iso)"
-
-      - name: Variant A current ide.js
+      - name: Run
         continue-on-error: true
         run: |
           set +e
-          timeout 300 ./tests/api/iso9660.js > /tmp/out-A.txt 2>&1
+          timeout 1500 ./tests/api/iso9660.js > /tmp/out.txt 2>&1
           rc=$?
-          grep -o 'Test passed\|Booted, inserting generated iso\|Timeout' /tmp/out-A.txt | sort -u | while IFS= read -r line; do echo "::error::A: $line"; done
-          echo "::error::A: rc=$rc"
-
-      - name: Variant B ide.js before the PACKET interrupt
+          grep -o 'Test passed\|Booted, inserting generated iso\|Timeout\|Bad iso\|assert' /tmp/out.txt | sort -u | while IFS= read -r line; do echo "::error::A: $line"; done
+          echo "::error::A: rc=$rc size=$(stat -c %s images/linux4.iso)"
+  atapi-b:
+    name: ATAPI B ide.js before the PACKET interrupt
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Setup Node.js version
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.17.0'
+      - name: Setup toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add wasm32-unknown-unknown
+      - name: Build debug wasm
+        run: make build/v86-debug.wasm
+      - name: Download image
+        run: |
+          mkdir -p images
+          curl -L --fail --silent --show-error -o images/linux4.iso https://i.copy.sh/linux4.iso
+      - name: Run
         continue-on-error: true
         run: |
+          set +e
           git checkout 85874fd -- src/ide.js
-          set +e
-          timeout 300 ./tests/api/iso9660.js > /tmp/out-B.txt 2>&1
+          echo "::error::B: checkout rc=$?"
+          timeout 1500 ./tests/api/iso9660.js > /tmp/out.txt 2>&1
           rc=$?
-          grep -o 'Test passed\|Booted, inserting generated iso\|Timeout' /tmp/out-B.txt | sort -u | while IFS= read -r line; do echo "::error::B: $line"; done
+          grep -o 'Test passed\|Booted, inserting generated iso\|Timeout\|Bad iso\|assert' /tmp/out.txt | sort -u | while IFS= read -r line; do echo "::error::B: $line"; done
           echo "::error::B: rc=$rc"
-
-      - name: Variant C ide.js before the IDE changes of this branch
+  atapi-c:
+    name: ATAPI C ide.js before this branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Setup Node.js version
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.17.0'
+      - name: Setup toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add wasm32-unknown-unknown
+      - name: Build debug wasm
+        run: make build/v86-debug.wasm
+      - name: Download image
+        run: |
+          mkdir -p images
+          curl -L --fail --silent --show-error -o images/linux4.iso https://i.copy.sh/linux4.iso
+      - name: Run
         continue-on-error: true
         run: |
-          git checkout 3395468 -- src/ide.js
           set +e
-          timeout 300 ./tests/api/iso9660.js > /tmp/out-C.txt 2>&1
+          git checkout 3395468 -- src/ide.js
+          echo "::error::C: checkout rc=$?"
+          timeout 1500 ./tests/api/iso9660.js > /tmp/out.txt 2>&1
           rc=$?
-          grep -o 'Test passed\|Booted, inserting generated iso\|Timeout' /tmp/out-C.txt | sort -u | while IFS= read -r line; do echo "::error::C: $line"; done
+          grep -o 'Test passed\|Booted, inserting generated iso\|Timeout\|Bad iso\|assert' /tmp/out.txt | sort -u | while IFS= read -r line; do echo "::error::C: $line"; done
           echo "::error::C: rc=$rc"
