@@ -1305,6 +1305,10 @@ IDEInterface.prototype.ata_command = function(cmd)
                 this.data_end = 12;
                 this.sector_count_reg = 0x01;   // 0x01: indicates transfer of a command packet (C/D)
                 this.status_reg = ATA_SR_DRDY|ATA_SR_DSC|ATA_SR_DRQ;
+                // [ATA-8] 7.18: DRQ is set and INTRQ asserted so the host knows it can write
+                // the command packet. Polling guests (the BIOS) do not need this, but an OS
+                // driver that waits for the interrupt would time out on every ATAPI command.
+                this.push_irq();
             }
             else
             {
