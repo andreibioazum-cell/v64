@@ -53,7 +53,7 @@ jobs:
   atapi-check:
     name: ATAPI check (temporary)
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -71,20 +71,37 @@ jobs:
       - name: Build debug wasm
         run: make build/v86-debug.wasm
 
-      - name: Download images
+      - name: Download image
         run: |
           mkdir -p images
-          code=$(curl -L --fail --silent --show-error -w '%{http_code}' -o images/linux4.iso https://i.copy.sh/linux4.iso || echo "curl-failed")
-          echo "::error::download http=$code"
-          echo "::error::size=$(stat -c %s images/linux4.iso 2>/dev/null || echo none)"
-          echo "::error::head=$(od -A n -t x1 -N 8 images/linux4.iso 2>/dev/null | tr -s ' ')"
+          curl -L --fail --silent --show-error -o images/linux4.iso https://i.copy.sh/linux4.iso
+          echo "::error::size=$(stat -c %s images/linux4.iso)"
 
-      - name: Run the ATAPI test
+      - name: Variant A current ide.js
         continue-on-error: true
         run: |
           set +e
-          timeout 420 ./tests/api/iso9660.js > /tmp/out.txt 2>&1
+          timeout 300 ./tests/api/iso9660.js > /tmp/out-A.txt 2>&1
           rc=$?
-          echo "::error::rc=$rc"
-          grep -c . /tmp/out.txt | sed 's/^/::error::lines=/'
-          grep -o "Test passed\|Booted, inserting generated iso\|Joliet filename found\|File contents found\|Binary file checksum matches\|Timeout" /tmp/out.txt | sort -u | while IFS= read -r line; do echo "::error::marker: $line"; done
+          grep -o 'Test passed\|Booted, inserting generated iso\|Timeout' /tmp/out-A.txt | sort -u | while IFS= read -r line; do echo "::error::A: $line"; done
+          echo "::error::A: rc=$rc"
+
+      - name: Variant B ide.js before the PACKET interrupt
+        continue-on-error: true
+        run: |
+          git checkout 85874fd -- src/ide.js
+          set +e
+          timeout 300 ./tests/api/iso9660.js > /tmp/out-B.txt 2>&1
+          rc=$?
+          grep -o 'Test passed\|Booted, inserting generated iso\|Timeout' /tmp/out-B.txt | sort -u | while IFS= read -r line; do echo "::error::B: $line"; done
+          echo "::error::B: rc=$rc"
+
+      - name: Variant C ide.js before the IDE changes of this branch
+        continue-on-error: true
+        run: |
+          git checkout 3395468 -- src/ide.js
+          set +e
+          timeout 300 ./tests/api/iso9660.js > /tmp/out-C.txt 2>&1
+          rc=$?
+          grep -o 'Test passed\|Booted, inserting generated iso\|Timeout' /tmp/out-C.txt | sort -u | while IFS= read -r line; do echo "::error::C: $line"; done
+          echo "::error::C: rc=$rc"
