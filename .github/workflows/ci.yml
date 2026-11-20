@@ -49,28 +49,3 @@ jobs:
           name: index.html
           path: build/index.html
           if-no-files-found: error
-
-  build-probe:
-    name: Build probe (temporary)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-      - name: Setup Node.js version
-        uses: actions/setup-node@v6
-        with:
-          node-version: '24.17.0'
-      - name: Setup toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add wasm32-unknown-unknown
-      - name: Build and report
-        continue-on-error: true
-        run: |
-          set +e
-          make all > /tmp/build.log 2>&1
-          rc=$?
-          grep -n -i -m 40 'ERROR\|error:\|WARNING - ' /tmp/build.log | tail -25 | while IFS= read -r line; do echo "::error::P $line"; done
-          tail -5 /tmp/build.log | while IFS= read -r line; do echo "::error::T $line"; done
-          echo "::error::rc=$rc"
