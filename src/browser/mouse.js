@@ -288,7 +288,7 @@ export function MouseAdapter(bus, screen_container)
 
     function touch_press_handler(e)
     {
-        const touches = e.changedTouches;
+        const touches = e["changedTouches"];
 
         if(!touches || !touches.length || !touch_on_screen(e))
         {
@@ -310,7 +310,7 @@ export function MouseAdapter(bus, screen_container)
         last_x = touch.clientX;
         last_y = touch.clientY;
 
-        if(e.touches && e.touches.length > 1)
+        if(e["touches"] && e["touches"].length > 1)
         {
             // The second finger switches from moving the pointer to scrolling
             touch_dragging = false;
@@ -328,7 +328,7 @@ export function MouseAdapter(bus, screen_container)
 
     function touch_drag_handler(e)
     {
-        const touches = e.changedTouches;
+        const touches = e["changedTouches"];
 
         if(!touches || !touches.length || !touch_on_screen(e))
         {
@@ -347,7 +347,7 @@ export function MouseAdapter(bus, screen_container)
 
         const touch = touches[touches.length - 1];
 
-        if(e.touches && e.touches.length > 1)
+        if(e["touches"] && e["touches"].length > 1)
         {
             // Two fingers scroll; a finger moving down means "wheel up"
             const moved = touch.clientY - touch_scroll_y;
