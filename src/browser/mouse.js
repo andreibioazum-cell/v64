@@ -254,13 +254,18 @@ export function MouseAdapter(bus, screen_container)
         }
     }
 
-    function touch_end_handler(e)
+    function release_buttons()
     {
         if(left_down || middle_down || right_down)
         {
             mouse.bus.send("mouse-click", [false, false, false]);
             left_down = middle_down = right_down = false;
         }
+    }
+
+    function touch_end_handler(e)
+    {
+        release_buttons();
     }
 
     // Touch mode ---------------------------------------------------------------
@@ -407,7 +412,7 @@ export function MouseAdapter(bus, screen_container)
         }
 
         // Ended mid drag or with two fingers: never leave a button pressed
-        touch_end_handler(e);
+        release_buttons();
     }
 
     // Press and release in quick succession, so the guest sees a real click
@@ -425,7 +430,7 @@ export function MouseAdapter(bus, screen_container)
         touch_click_timer = setTimeout(function()
         {
             touch_click_timer = 0;
-            touch_end_handler();
+            release_buttons();
         }, TOUCH_CLICK_TIME);
     }
 
