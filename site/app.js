@@ -40,8 +40,8 @@
     var progress_fill = el("progress_fill");
     var progress_percent_el = el("progress_percent");
     var progress_label_el = el("progress_label");
-    var turbo_input = el("turbo");
-    var turbo_label = el("turbo_label");
+    var touch_input = el("touch");
+    var touch_label = el("touch_label");
 
     function decode_base64(b64)
     {
@@ -107,65 +107,49 @@
         }
     }
 
-    // "Супер-ускорение": the maximum the page can give a guest — the biggest guest RAM,
-    // SeaBIOS fastboot (skips part of the POST), ACPI tables for modern systems, JIT, and
-    // the images read into memory up front instead of being streamed from the file.
-    function turbo_enabled()
+    // "Сенсорный режим": the guest pointer becomes a phone-like finger. One finger
+    // drags the pointer, a tap clicks, a long press is a right click and two fingers
+    // scroll. The page also hides the host cursor, so nothing but the pointer the guest
+    // draws itself (if it draws one) is visible on the screen.
+    function touch_enabled()
     {
-        return !!(turbo_input && turbo_input.checked);
+        return !!(touch_input && touch_input.checked);
     }
 
-    function max_ram_mib()
+    function update_touch_class()
     {
-        var max = 0;
+        var on = touch_enabled();
 
-        for(var i = 0; i < ram_select.options.length; i++)
+        if(touch_label)
         {
-            max = Math.max(max, parseInt(ram_select.options[i].value, 10) || 0);
+            touch_label.classList.toggle("touch_on", on);
         }
-        return max || 2048;
+        if(screen_container)
+        {
+            screen_container.classList.toggle("touch_mode", on);
+        }
     }
 
-    function apply_turbo()
+    function apply_touch_mode()
     {
-        var on = turbo_enabled();
+        var on = touch_enabled();
 
-        if(turbo_label)
+        update_touch_class();
+
+        if(emulator && typeof emulator.mouse_set_touch_mode === "function")
         {
-            turbo_label.classList.toggle("turbo_on", on);
+            emulator.mouse_set_touch_mode(on);
         }
+
+        log("экран", on ?
+            "сенсорный режим включён: палец ведёт курсор, касание — клик, удержание — правая кнопка, два пальца — прокрутка, курсор мыши на экране скрыт" :
+            "сенсорный режим выключен: снова работает обычная мышь");
 
         if(!emulator)
         {
-            if(on && !turbo_ram_mib)
-            {
-                turbo_ram_mib = selected_ram_mib();
-                ram_select.value = String(max_ram_mib());
-                ram_select.disabled = true;
-            }
-            else if(!on && turbo_ram_mib)
-            {
-                ram_select.value = String(turbo_ram_mib);
-                ram_select.disabled = false;
-                turbo_ram_mib = 0;
-            }
-        }
-
-        if(emulator)
-        {
-            log("машина", "супер-ускорение " + (on ? "включено" : "выключено") + " — применится после перезагрузки страницы", "warn");
-            set_status("Супер-ускорение " + (on ? "включено" : "выключено") + ": применится после перезагрузки страницы");
-            return;
-        }
-
-        if(on)
-        {
-            log("машина", "супер-ускорение: ОЗУ гостя " + max_ram_mib() + " МиБ, JIT, SeaBIOS fastboot, ACPI, образы читаются в память целиком");
-            set_status("Супер-ускорение: " + max_ram_mib() + " МиБ ОЗУ, JIT, fastboot, ACPI");
-        }
-        else
-        {
-            set_status("Выберите ISO-образ или образ жёсткого диска.");
+            set_status(on ?
+                "Сенсорный режим: касание — клик, удержание — правая кнопка, два пальца — прокрутка." :
+                "Выберите ISO-образ или образ жёсткого диска.");
         }
     }
 
@@ -267,7 +251,7 @@
     var hdd_data = null;
     var iso_data = null;
     var progress_value = 0;
-    var turbo_ram_mib = 0;
+    var screen_container = el("screen_container");
 
     // Images up to this size are read into memory by the page itself: that gives real
     // percentages and, more importantly, synchronous reads while the guest boots (v86
@@ -1180,7 +1164,7 @@
             return;
         }
 
-        ram_select.disabled = turbo_enabled();
+        ram_select.disabled = false;
         start_btn.disabled = false;
         set_running_controls(false);
         log("машина", "ошибка запуска: " + message, "err");
@@ -1237,7 +1221,7 @@
         var pending = [];
         var total = 0;
 
-        var read_limit = turbo_enabled() ? Infinity : READ_LIMIT;
+        var read_limit = READ_LIMIT;
 
         if(hdd_file && !hdd_data && hdd_file.size <= read_limit)
         {
@@ -1335,11 +1319,6 @@
             screen_container: el("screen_container"),
             memory_size: ram_mib * MiB,
             vga_memory_size: 8 * MiB,
-            // Maximum speed on request: JIT is on by default, fastboot skips part of the
-            // SeaBIOS POST and ACPI tables let modern systems skip their own workarounds.
-            disable_jit: turbo_enabled() ? false : undefined,
-            fastboot: turbo_enabled(),
-            acpi: turbo_enabled(),
             bios: { buffer: seabios.buffer },
             vga_bios: { buffer: vgabios.buffer },
             // The hard disk goes first in the boot order when it is present; the
@@ -1352,7 +1331,13 @@
         });
 
         log("машина", "старт: ОЗУ гостя " + ram_mib + " МиБ" +
-            (turbo_enabled() ? ", супер-ускорение: JIT, fastboot, ACPI" : ""));
+            (touch_enabled() ? ", сенсорный режим" : ""));
+
+        if(touch_enabled() && typeof emulator.mouse_set_touch_mode === "function")
+        {
+            // The setting applies to the fresh machine right away, no reload needed
+            emulator.mouse_set_touch_mode(true);
+        }
         set_progress(40, "машина запущена, BIOS стартует");
 
         emulator.add_listener("serial0-output-byte", on_serial_byte);
@@ -1483,9 +1468,9 @@
         log_clear_btn.addEventListener("click", clear_log);
     }
 
-    if(turbo_input)
+    if(touch_input)
     {
-        turbo_input.addEventListener("change", apply_turbo);
+        touch_input.addEventListener("change", apply_touch_mode);
     }
 
     if(iso_clear_btn)
@@ -1646,9 +1631,18 @@
         }
     });
 
+    // Where the finger is the pointer anyway (phones, tablets) the touch mode starts on,
+    // so the screen does not scroll and a tap is a click from the first touch.
+    if(touch_input && !touch_input.checked && window.matchMedia &&
+        window.matchMedia("(pointer: coarse)").matches)
+    {
+        touch_input.checked = true;
+    }
+
     // Narrow screens are usually phones with less RAM.
     ram_select.value = String(is_small_screen() ? 256 : 512);
 
+    update_touch_class();
     set_running_controls(false);
     set_progress(0, "Выберите ISO-образ или образ жёсткого диска");
     set_status("Выберите ISO-образ или образ жёсткого диска.");

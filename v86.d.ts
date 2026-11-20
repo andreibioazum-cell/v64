@@ -785,6 +785,13 @@ export class V86 {
     mouse_set_enabled(enabled: boolean): void;
 
     /**
+     * Turn the guest pointer into a phone-like finger: one finger drags the pointer, a
+     * tap clicks, a long press is a right click and two fingers scroll. The host cursor
+     * is hidden while this is on (only browsers).
+     */
+    mouse_set_touch_mode(enabled: boolean): void;
+
+    /**
      * Enable or disable sending keyboard events to the emulated PS2 controller.
      */
     keyboard_set_enabled(enabled: boolean): void;

@@ -1262,6 +1262,21 @@ V86.prototype.mouse_set_enabled = function(enabled)
 V86.prototype.mouse_set_status = V86.prototype.mouse_set_enabled;
 
 /**
+ * Turn the guest pointer into a phone-like finger: one finger drags the pointer, a tap
+ * clicks, a long press is a right click and two fingers scroll. The host cursor is
+ * hidden while this is on, so only the guest's own pointer stays visible.
+ *
+ * @param {boolean} enabled
+ */
+V86.prototype.mouse_set_touch_mode = function(enabled)
+{
+    if(this.mouse_adapter)
+    {
+        this.mouse_adapter.set_touch_mode(enabled);
+    }
+};
+
+/**
  * Enable or disable sending keyboard events to the emulated PS2 controller.
  *
  * @param {boolean} enabled

@@ -83,7 +83,7 @@ button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accen
 }
 #ram:disabled { opacity: .4; }
 .ram_label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
-.turbo_label {
+.touch_label {
     display: inline-flex;
     align-items: center;
     gap: 8px;
@@ -95,8 +95,19 @@ button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accen
     color: var(--fg);
     cursor: pointer;
 }
-.turbo_label input { width: 20px; height: 20px; accent-color: var(--accent); }
-.turbo_label.turbo_on { border-color: var(--accent); color: #fff; }
+.touch_label input { width: 20px; height: 20px; accent-color: var(--accent); }
+.touch_label.touch_on { border-color: var(--accent); color: #fff; }
+
+/* Сенсорный режим: курсора мыши на экране нет, палец не крутит и не зумит страницу */
+#screen_container.touch_mode {
+    cursor: none !important;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+}
+#screen_container.touch_mode canvas, #screen_container.touch_mode > div {
+    cursor: none !important;
+}
 #iso, #hdd { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 
 #typing {
@@ -194,7 +205,7 @@ button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accen
 <body>
 <header>
     <h1>v86 · x86-64</h1>
-    <p class="hint">Эмулятор ПК в браузере. Выберите ISO-образ (например, Alpine Linux x86_64) или образ жёсткого диска (образ раздела/диска целиком, .img/.raw) и запустите. Если выбраны оба, при запуске загрузка идёт с жёсткого диска. Если загрузка не удалась, причина будет в логе под экраном.</p>
+    <p class="hint">Эмулятор ПК в браузере. Выберите ISO-образ (например, Alpine Linux x86_64) или образ жёсткого диска (образ раздела/диска целиком, .img/.raw) и запустите. Если выбраны оба, при запуске загрузка идёт с жёсткого диска. На телефоне или планшете включите «Сенсорный режим» — палец будет вести курсор, касание станет кликом. Если загрузка не удалась, причина будет в логе под экраном.</p>
 </header>
 
 <main>
@@ -218,9 +229,10 @@ button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accen
                 <option value="2048">2048 МиБ</option>
             </select>
         </label>
-        <label class="turbo_label" id="turbo_label" for="turbo">
-            <input type="checkbox" id="turbo">
-            Супер-ускорение
+        <label class="touch_label" id="touch_label" for="touch"
+               title="Палец вместо мыши: касание — клик, удержание — правая кнопка, два пальца — прокрутка">
+            <input type="checkbox" id="touch">
+            Сенсорный режим
         </label>
         <button id="start" class="primary" disabled>Запустить</button>
         <button id="pause" disabled>Пауза</button>
