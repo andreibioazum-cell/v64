@@ -108,6 +108,46 @@ button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accen
 #screen_container.touch_mode canvas, #screen_container.touch_mode > div {
     cursor: none !important;
 }
+
+/* На весь экран: экран виден целиком, без обрезки снизу, по центру */
+#screen_container:fullscreen {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100vw;
+    height: 100vh;
+    border: 0;
+    border-radius: 0;
+    background: #000;
+}
+#screen_container:-webkit-full-screen {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100vw;
+    height: 100vh;
+    border: 0;
+    border-radius: 0;
+    background: #000;
+}
+#screen_container:fullscreen canvas {
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    margin: auto;
+}
+#screen_container:-webkit-full-screen canvas {
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    margin: auto;
+}
+#screen_container:fullscreen > div,
+#screen_container:-webkit-full-screen > div {
+    max-height: 100%;
+}
 #iso, #hdd { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 
 #typing {

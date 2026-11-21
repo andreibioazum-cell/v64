@@ -1210,7 +1210,14 @@ V86.prototype.screen_go_fullscreen = function()
 
     if(fn)
     {
-        fn.call(elem);
+        // A refused fullscreen request is not an error either: the page reports it in
+        // its own log, and an unhandled rejection would look like a broken machine
+        var started = fn.call(elem);
+
+        if(started && typeof started.catch === "function")
+        {
+            started.catch(function() {});
+        }
 
         // This is necessary, because otherwise chromium keyboard doesn't work anymore.
         // Might (but doesn't seem to) break something else
@@ -1219,30 +1226,61 @@ V86.prototype.screen_go_fullscreen = function()
     }
 
     try {
-        navigator.keyboard.lock();
+        navigator.keyboard && navigator.keyboard.lock();
     } catch(e) {}
 
-    this.lock_mouse();
+    // Grabbing the pointer hides the host cursor and keeps a relative mouse usable, but
+    // it needs a fresh user gesture, it is refused on touch devices and it would fight
+    // with the finger in touch mode, so it is only a bonus
+    var touch_mode = this.mouse_adapter && this.mouse_adapter.touch_mode;
+
+    if(!touch_mode && !this.absolute_pointer_enabled)
+    {
+        this.lock_mouse();
+    }
 };
 
 /**
  * Lock the mouse cursor: It becomes invisble and is not moved out of the
- * browser window.
+ * browser window. Never rejects: browsers refuse the request without a fresh user
+ * gesture (and phones do not support it at all), which is not an error.
+ *
+ * @return {Promise<boolean>} whether the pointer is locked now
  */
 V86.prototype.lock_mouse = async function()
 {
+    if(typeof document === "undefined" || !document.body)
+    {
+        return false;
+    }
+
     const elem = document.body;
+
+    if(!elem.requestPointerLock)
+    {
+        return false;
+    }
 
     try
     {
         await elem.requestPointerLock({
             unadjustedMovement: true,
         });
+        return !!document.pointerLockElement;
     }
     catch(e)
     {
-        // as per MDN, retry without unadjustedMovement option
+        // As per MDN, retry without the unadjustedMovement option
+    }
+
+    try
+    {
         await elem.requestPointerLock();
+        return !!document.pointerLockElement;
+    }
+    catch(e)
+    {
+        return false;
     }
 };
 

@@ -251,6 +251,7 @@
     var hdd_data = null;
     var iso_data = null;
     var progress_value = 0;
+    var browser_permission_noted = false;
     var screen_container = el("screen_container");
 
     // Images up to this size are read into memory by the page itself: that gives real
@@ -1527,12 +1528,31 @@
         set_status(ram_warning() || "ОЗУ гостя: " + selected_ram_mib() + " МиБ. Изменить можно после перезагрузки страницы.");
     });
 
+    // A refused pointer lock or a refused fullscreen is not a machine failure: browsers
+    // only allow them right after a click and phones refuse pointer lock altogether.
+    function is_browser_permission_error(message)
+    {
+        return /pointer lock|fullscreen|full screen/i.test(message);
+    }
+
     // The V86 constructor starts the machine asynchronously (wasm and BIOS loading,
     // guest memory allocation), so a failure there surfaces as an unhandled rejection.
     window.addEventListener("unhandledrejection", function(e)
     {
         var reason = e.reason;
         var message = reason && reason.message ? reason.message : String(reason);
+
+        if(is_browser_permission_error(message))
+        {
+            // Say it once, quietly: the machine itself keeps running
+            if(!browser_permission_noted)
+            {
+                browser_permission_noted = true;
+                log("экран", "браузер не дал захватить курсор или развернуть экран на весь экран — работаем без этого", "warn");
+            }
+            return;
+        }
+
         log("ошибка", message, "err");
         set_progress(progress_value, "ошибка: " + message, "err");
         if(emulator && !booted)
@@ -1589,13 +1609,70 @@
         }
     });
 
+    function fullscreen_element()
+    {
+        return document.fullscreenElement || document.webkitFullscreenElement || null;
+    }
+
+    function fullscreen_supported()
+    {
+        var element = screen_container;
+
+        return !!(element && (element.requestFullscreen || element.webkitRequestFullscreen ||
+            element.mozRequestFullScreen || element.msRequestFullScreen));
+    }
+
+    function update_fullscreen_label()
+    {
+        fullscreen_btn.textContent = fullscreen_element() ? "Выйти из полного экрана" : "На весь экран";
+    }
+
+    // Fullscreen needs a click, and on a phone there is no Escape key to leave it, so
+    // the same button gets the user out again.
     fullscreen_btn.addEventListener("click", function()
     {
-        if(emulator)
+        if(!emulator)
         {
-            emulator.screen_go_fullscreen();
+            return;
         }
+
+        var element = fullscreen_element();
+
+        if(element)
+        {
+            var exit = document.exitFullscreen || document.webkitExitFullscreen;
+
+            if(exit)
+            {
+                try
+                {
+                    var leaving = exit.call(document);
+                    leaving && leaving.catch && leaving.catch(function() {});
+                }
+                catch(e)
+                {
+                    // Nothing to do: the browser already left fullscreen
+                }
+            }
+            if(document.exitPointerLock)
+            {
+                document.exitPointerLock();
+            }
+            return;
+        }
+
+        if(!fullscreen_supported())
+        {
+            log("экран", "этот браузер не умеет разворачивать экран на весь экран", "warn");
+            set_status("Браузер не поддерживает полноэкранный режим — поверните телефон или откройте страницу в Chrome.");
+            return;
+        }
+
+        emulator.screen_go_fullscreen();
     });
+
+    document.addEventListener("fullscreenchange", update_fullscreen_label);
+    document.addEventListener("webkitfullscreenchange", update_fullscreen_label);
 
     // Phone keyboards do not send physical key events the emulator understands
     // (keyCode 229), so text typed in the input field is sent as characters.
