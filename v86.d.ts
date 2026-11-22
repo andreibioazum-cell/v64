@@ -721,6 +721,12 @@ export class V86 {
     eject_fdb(): void;
 
     /**
+     * Set the image inserted in the primary master hard disk drive. Can be
+     * changed at runtime, as when physically changing the hard disk.
+     */
+    set_hda(image: V86Image): Promise<void>;
+
+    /**
      * Set the image inserted in the CD-ROM drive. Can be changed at runtime, as
      * when physically changing the CD-ROM.
      */
@@ -777,6 +783,24 @@ export class V86 {
      * Enable or disable sending mouse events to the emulated PS2 controller.
      */
     mouse_set_enabled(enabled: boolean): void;
+
+    /**
+     * Turn the guest pointer into a phone-like finger: one finger drags the pointer, a
+     * tap clicks, a long press is a right click and two fingers scroll. The host cursor
+     * is hidden while this is on (only browsers).
+     */
+    mouse_set_touch_mode(enabled: boolean): void;
+
+    /**
+     * Click a mouse button at the current pointer position (for on-screen buttons).
+     * 1 = left, 2 = middle, 3 = right.
+     */
+    mouse_click(button: number): void;
+
+    /**
+     * Turn the guest wheel by the given number of notches, positive is up.
+     */
+    mouse_scroll(steps: number): void;
 
     /**
      * Enable or disable sending keyboard events to the emulated PS2 controller.

@@ -12,3 +12,10 @@ pub mod jit0f;
 pub mod analyzer;
 #[rustfmt::skip]
 pub mod analyzer0f;
+
+#[rustfmt::skip]
+pub mod jit64;
+#[rustfmt::skip]
+pub mod jit64_0f;
+#[rustfmt::skip]
+pub mod jit64_wrappers;

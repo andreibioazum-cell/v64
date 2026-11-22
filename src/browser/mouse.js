@@ -12,12 +12,29 @@ export function MouseAdapter(bus, screen_container)
 {
     const SPEED_FACTOR = 1;
 
+    // A finger that wanders less than this many CSS pixels is still a tap, not a drag
+    const TOUCH_TAP_SLOP = 8;
+    // A tap held longer than this is a right click, as on a phone
+    const TOUCH_LONG_PRESS = 550;
+    // How long a tap keeps the button down, so the guest sees a real click
+    const TOUCH_CLICK_TIME = 60;
+    // Vertical finger travel per wheel step while scrolling with two fingers
+    const TOUCH_SCROLL_STEP = 16;
+
     var left_down = false,
         right_down = false,
         middle_down = false,
 
         last_x = 0,
         last_y = 0,
+
+        touch_dragging = false,
+        touch_moved = false,
+        touch_pressed_at = 0,
+        touch_press_x = 0,
+        touch_press_y = 0,
+        touch_scroll_y = 0,
+        touch_click_timer = 0,
 
         mouse = this;
 
@@ -29,6 +46,9 @@ export function MouseAdapter(bus, screen_container)
 
     // set by the guest's absolute pointing device driver
     this.absolute_mouse = false;
+
+    // set by the page: the finger replaces the mouse (see set_touch_mode)
+    this.touch_mode = false;
 
     this.bus = bus;
 
@@ -59,8 +79,55 @@ export function MouseAdapter(bus, screen_container)
     {
         if(screen_container)
         {
-            const hide = this.absolute_mouse && this.enabled && this.emu_enabled;
+            // In touch mode there is no host pointer at all: the only pointer on the
+            // screen is the one the guest draws itself (if it draws one)
+            const hide = this.touch_mode ||
+                (this.absolute_mouse && this.enabled && this.emu_enabled);
             screen_container.style.cursor = hide ? "none" : "";
+        }
+    };
+
+    /**
+     * Turn the guest pointer into a phone-like finger: one finger drags the pointer, a
+     * short tap clicks, a long press is a right click and two fingers scroll. While it
+     * is on, the host hides its cursor, so nothing but the guest's own pointer is seen.
+     *
+     * @param {boolean} enabled
+     */
+    this.set_touch_mode = function(enabled)
+    {
+        this.touch_mode = !!enabled;
+
+        if(typeof window !== "undefined")
+        {
+            remove_touch_listeners();
+            add_touch_listeners();
+        }
+
+        mouse.update_cursor();
+    };
+
+    /**
+     * Click a button at the current pointer position. The page uses this for its own
+     * on-screen buttons on a touch device.
+     *
+     * @param {number} which 1 = left, 2 = middle, 3 = right
+     */
+    this.click = function(which)
+    {
+        click_button(which === 2 ? 2 : which === 3 ? 3 : 1);
+    };
+
+    /**
+     * Turn the guest wheel by the given number of notches, positive is up.
+     *
+     * @param {number} steps
+     */
+    this.scroll = function(steps)
+    {
+        if(steps)
+        {
+            mouse.bus.send("mouse-wheel", [steps, 0]);
         }
     };
 
@@ -70,9 +137,7 @@ export function MouseAdapter(bus, screen_container)
         {
             return;
         }
-        window.removeEventListener("touchstart", touch_start_handler, false);
-        window.removeEventListener("touchend", touch_end_handler, false);
-        window.removeEventListener("touchmove", mousemove_handler, false);
+        remove_touch_listeners();
         window.removeEventListener("mousemove", mousemove_handler, false);
         window.removeEventListener("mousedown", mousedown_handler, false);
         window.removeEventListener("mouseup", mouseup_handler, false);
@@ -81,6 +146,48 @@ export function MouseAdapter(bus, screen_container)
         document.removeEventListener("pointerlockchange", pointerlockchange_handler, false);
     };
 
+    function remove_touch_listeners()
+    {
+        if(typeof window === "undefined")
+        {
+            return;
+        }
+        window.removeEventListener("touchstart", touch_start_handler, false);
+        window.removeEventListener("touchstart", touch_press_handler, false);
+        window.removeEventListener("touchmove", mousemove_handler, false);
+        window.removeEventListener("touchmove", touch_drag_handler, false);
+        window.removeEventListener("touchend", touch_end_handler, false);
+        window.removeEventListener("touchend", touch_release_handler, false);
+        window.removeEventListener("touchcancel", touch_end_handler, false);
+        window.removeEventListener("touchcancel", touch_release_handler, false);
+    }
+
+    function add_touch_listeners()
+    {
+        if(typeof window === "undefined")
+        {
+            return;
+        }
+
+        if(mouse.touch_mode)
+        {
+            // Not passive: a finger on the screen must not scroll, zoom or select on the
+            // page behind it. The touch move listener replaces the mouse one, because a
+            // finger has to be interpreted as a finger, not as a hovering pointer.
+            window.addEventListener("touchstart", touch_press_handler, { passive: false });
+            window.addEventListener("touchmove", touch_drag_handler, { passive: false });
+            window.addEventListener("touchend", touch_release_handler, false);
+            window.addEventListener("touchcancel", touch_release_handler, false);
+        }
+        else
+        {
+            window.addEventListener("touchstart", touch_start_handler, false);
+            window.addEventListener("touchmove", mousemove_handler, false);
+            window.addEventListener("touchend", touch_end_handler, false);
+            window.addEventListener("touchcancel", touch_end_handler, false);
+        }
+    }
+
     this.init = function()
     {
         if(typeof window === "undefined")
@@ -88,10 +195,8 @@ export function MouseAdapter(bus, screen_container)
             return;
         }
         this.destroy();
+        this.set_touch_mode(this.touch_mode);
 
-        window.addEventListener("touchstart", touch_start_handler, false);
-        window.addEventListener("touchend", touch_end_handler, false);
-        window.addEventListener("touchmove", mousemove_handler, false);
         window.addEventListener("mousemove", mousemove_handler, false);
         window.addEventListener("mousedown", mousedown_handler, false);
         window.addEventListener("mouseup", mouseup_handler, false);
@@ -135,6 +240,12 @@ export function MouseAdapter(bus, screen_container)
             return false;
         }
 
+        // The page's own buttons over the screen are not the guest's
+        if(is_host_ui(e.target))
+        {
+            return false;
+        }
+
         const MOVE_MOUSE_WHEN_OVER_SCREEN_ONLY = true;
 
         if(MOVE_MOUSE_WHEN_OVER_SCREEN_ONLY)
@@ -173,13 +284,208 @@ export function MouseAdapter(bus, screen_container)
         }
     }
 
-    function touch_end_handler(e)
+    function release_buttons()
     {
         if(left_down || middle_down || right_down)
         {
             mouse.bus.send("mouse-click", [false, false, false]);
             left_down = middle_down = right_down = false;
         }
+    }
+
+    function touch_end_handler(e)
+    {
+        release_buttons();
+    }
+
+    // Touch mode ---------------------------------------------------------------
+
+    // Elements marked with data-host-ui (the page's own buttons over the screen) belong
+    // to the page, not to the guest.
+    function is_host_ui(node)
+    {
+        var element = node && node.nodeType === 1 ? node : (node && node.parentElement);
+
+        while(element && element !== screen_container)
+        {
+            if(element.hasAttribute && element.hasAttribute("data-host-ui"))
+            {
+                return true;
+            }
+            element = element.parentElement;
+        }
+        return false;
+    }
+
+    // Only touches on the screen itself belong to the guest; the rest of the page keeps
+    // scrolling normally.
+    function touch_on_screen(e)
+    {
+        const parent = screen_container || document.body;
+        return is_child(e.target, parent) && !is_host_ui(e.target);
+    }
+
+    // Guests with an absolute pointing device follow this directly, so a tap lands
+    // exactly where the finger was.
+    function send_absolute(client_x, client_y)
+    {
+        if(!screen_container || typeof document === "undefined" || document.pointerLockElement)
+        {
+            return;
+        }
+        const rect = screen_container.getBoundingClientRect();
+        mouse.bus.send("mouse-absolute", [
+            client_x - rect.left, client_y - rect.top, rect.width, rect.height]);
+    }
+
+    function touch_press_handler(e)
+    {
+        const touches = e["changedTouches"];
+
+        if(!touches || !touches.length || !touch_on_screen(e))
+        {
+            return;
+        }
+
+        // Nothing on the page may scroll, zoom or scroll back while a finger is here
+        if(e.cancelable)
+        {
+            e.preventDefault();
+        }
+
+        if(!may_handle(e))
+        {
+            return;
+        }
+
+        const touch = touches[touches.length - 1];
+        last_x = touch.clientX;
+        last_y = touch.clientY;
+
+        if(e["touches"] && e["touches"].length > 1)
+        {
+            // The second finger switches from moving the pointer to scrolling
+            touch_dragging = false;
+            touch_moved = true;
+            touch_scroll_y = touch.clientY;
+            return;
+        }
+
+        touch_dragging = true;
+        touch_moved = false;
+        touch_pressed_at = Date.now();
+        touch_press_x = touch.clientX;
+        touch_press_y = touch.clientY;
+    }
+
+    function touch_drag_handler(e)
+    {
+        const touches = e["changedTouches"];
+
+        if(!touches || !touches.length || !touch_on_screen(e))
+        {
+            return;
+        }
+
+        if(e.cancelable)
+        {
+            e.preventDefault();
+        }
+
+        if(!may_handle(e))
+        {
+            return;
+        }
+
+        const touch = touches[touches.length - 1];
+
+        if(e["touches"] && e["touches"].length > 1)
+        {
+            // Two fingers scroll; a finger moving down means "wheel up"
+            const moved = touch.clientY - touch_scroll_y;
+            touch_scroll_y = touch.clientY;
+
+            const steps = Math.trunc(moved / TOUCH_SCROLL_STEP);
+
+            if(steps)
+            {
+                mouse.bus.send("mouse-wheel", [steps, 0]);
+            }
+            return;
+        }
+
+        if(!touch_dragging)
+        {
+            return;
+        }
+
+        const delta_x = touch.clientX - last_x;
+        const delta_y = touch.clientY - last_y;
+
+        // A finger that barely moved is still a tap: do not nudge the pointer
+        if(!touch_moved &&
+            Math.abs(touch.clientX - touch_press_x) <= TOUCH_TAP_SLOP &&
+            Math.abs(touch.clientY - touch_press_y) <= TOUCH_TAP_SLOP)
+        {
+            return;
+        }
+
+        touch_moved = true;
+        last_x = touch.clientX;
+        last_y = touch.clientY;
+
+        mouse.bus.send("mouse-delta", [delta_x * SPEED_FACTOR, -delta_y * SPEED_FACTOR]);
+        send_absolute(touch.clientX, touch.clientY);
+    }
+
+    function touch_release_handler(e)
+    {
+        if(e.cancelable)
+        {
+            e.preventDefault();
+        }
+
+        const tap = touch_dragging && !touch_moved && may_handle(e);
+        const long_press = tap && Date.now() - touch_pressed_at >= TOUCH_LONG_PRESS;
+
+        touch_dragging = false;
+        touch_moved = false;
+
+        if(tap)
+        {
+            send_absolute(touch_press_x, touch_press_y);
+            touch_click(long_press);
+            return;
+        }
+
+        // Ended mid drag or with two fingers: never leave a button pressed
+        release_buttons();
+    }
+
+    // Press and release in quick succession, so the guest sees a real click.
+    // which: 1 = left, 2 = middle, 3 = right
+    function click_button(which)
+    {
+        if(touch_click_timer)
+        {
+            clearTimeout(touch_click_timer);
+        }
+
+        left_down = which === 1;
+        middle_down = which === 2;
+        right_down = which === 3;
+        mouse.bus.send("mouse-click", [left_down, middle_down, right_down]);
+
+        touch_click_timer = setTimeout(function()
+        {
+            touch_click_timer = 0;
+            release_buttons();
+        }, TOUCH_CLICK_TIME);
+    }
+
+    function touch_click(right)
+    {
+        click_button(right ? 3 : 1);
     }
 
     function mousemove_handler(e)
@@ -263,11 +569,9 @@ export function MouseAdapter(bus, screen_container)
 
         // Under pointer lock the page coordinates don't change, so no
         // meaningful absolute position can be reported
-        if(screen_container && !document.pointerLockElement)
+        if(!document.pointerLockElement)
         {
-            const rect = screen_container.getBoundingClientRect();
-            mouse.bus.send("mouse-absolute", [
-                e.clientX - rect.left, e.clientY - rect.top, rect.width, rect.height]);
+            send_absolute(e.clientX, e.clientY);
         }
     }
 

@@ -16,7 +16,9 @@ var emulator = new V86({
     vga_bios: { url: __dirname + "/../../bios/vgabios.bin" },
     multiboot: { url: process.argv[2] },
     autostart: true,
-    memory_size: 64 * 1024 * 1024,
+    // 256 MiB: the access test allocates its scratch page tables in a pool at
+    // 33..120 MiB and needs them to fit inside guest RAM
+    memory_size: 256 * 1024 * 1024,
     disable_jit: +process.env.DISABLE_JIT,
     log_level: 0,
 });

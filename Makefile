@@ -3,12 +3,14 @@ CLOSURE=$(CLOSURE_DIR)/compiler.jar
 NASM_TEST_DIR=./tests/nasm
 
 INSTRUCTION_TABLES=src/rust/gen/jit.rs src/rust/gen/jit0f.rs \
+		   src/rust/gen/jit64.rs src/rust/gen/jit64_0f.rs src/rust/gen/jit64_wrappers.rs \
 		   src/rust/gen/interpreter.rs src/rust/gen/interpreter0f.rs \
 		   src/rust/gen/analyzer.rs src/rust/gen/analyzer0f.rs \
 
 # Only the dependencies common to both generate_{jit,interpreter}.js
-GEN_DEPENDENCIES=$(filter-out gen/generate_interpreter.js gen/generate_jit.js gen/generate_analyzer.js, $(wildcard gen/*.js))
+GEN_DEPENDENCIES=$(filter-out gen/generate_interpreter.js gen/generate_jit.js gen/generate_jit64.js gen/generate_analyzer.js, $(wildcard gen/*.js))
 JIT_DEPENDENCIES=$(GEN_DEPENDENCIES) gen/generate_jit.js
+JIT64_DEPENDENCIES=$(GEN_DEPENDENCIES) gen/generate_jit64.js
 INTERPRETER_DEPENDENCIES=$(GEN_DEPENDENCIES) gen/generate_interpreter.js
 ANALYZER_DEPENDENCIES=$(GEN_DEPENDENCIES) gen/generate_analyzer.js
 
@@ -20,7 +22,7 @@ endif
 WASM_OPT ?= false
 
 default: build/v86-debug.wasm
-all: build/v86_all.js build/libv86.js build/libv86.mjs build/v86.wasm
+all: build/index.html build/v86_all.js build/libv86.js build/libv86.mjs build/v86.wasm
 all-debug: build/libv86-debug.js build/libv86-debug.mjs build/v86-debug.wasm
 browser: build/v86_all.js
 
@@ -93,11 +95,16 @@ BROWSER_FILES=screen.js keyboard.js mouse.js speaker.js serial.js \
 RUST_FILES=$(shell find src/rust/ -name '*.rs') \
 	   src/rust/gen/interpreter.rs src/rust/gen/interpreter0f.rs \
 	   src/rust/gen/jit.rs src/rust/gen/jit0f.rs \
+	   src/rust/gen/jit64.rs src/rust/gen/jit64_0f.rs src/rust/gen/jit64_wrappers.rs \
 	   src/rust/gen/analyzer.rs src/rust/gen/analyzer0f.rs
 
 CORE_FILES:=$(addprefix src/,$(CORE_FILES))
 LIB_FILES:=$(addprefix lib/,$(LIB_FILES))
 BROWSER_FILES:=$(addprefix src/browser/,$(BROWSER_FILES))
+
+# Single self-contained page: libv86 + wasm + BIOS inlined, see site/ and tools/build-single-html.mjs
+build/index.html: build/libv86.js build/v86.wasm bios/seabios.bin bios/vgabios.bin site/index.html site/app.js tools/build-single-html.mjs
+	node tools/build-single-html.mjs build/index.html
 
 build/v86_all.js: $(CLOSURE) src/*.js src/browser/*.js lib/*.js
 	mkdir -p build
@@ -196,6 +203,13 @@ src/rust/gen/jit.rs: $(JIT_DEPENDENCIES)
 src/rust/gen/jit0f.rs: $(JIT_DEPENDENCIES)
 	./gen/generate_jit.js --output-dir build/ --table jit0f
 
+src/rust/gen/jit64.rs: $(JIT64_DEPENDENCIES)
+	./gen/generate_jit64.js --output-dir build/ --table jit64
+src/rust/gen/jit64_0f.rs: $(JIT64_DEPENDENCIES)
+	./gen/generate_jit64.js --output-dir build/ --table jit64_0f
+src/rust/gen/jit64_wrappers.rs: $(JIT64_DEPENDENCIES)
+	./gen/generate_jit64.js --output-dir build/ --table jit64_wrappers
+
 src/rust/gen/interpreter.rs: $(INTERPRETER_DEPENDENCIES)
 	./gen/generate_interpreter.js --output-dir build/ --table interpreter
 src/rust/gen/interpreter0f.rs: $(INTERPRETER_DEPENDENCIES)
@@ -272,18 +286,6 @@ clean:
 run:
 	python3 -m http.server 2> /dev/null
 
-update_version:
-	set -e ;\
-	COMMIT=`git log --format="%h" -n 1` ;\
-	DATE=`git log --date="format:%b %e, %Y %H:%m" --format="%cd" -n 1` ;\
-	SEARCH='<code>Version: <a id="version" href="https://github.com/copy/v86/commits/[a-f0-9]\+">[a-f0-9]\+</a> ([^(]\+)</code>' ;\
-	REPLACE='<code>Version: <a id="version" href="https://github.com/copy/v86/commits/'$$COMMIT'">'$$COMMIT'</a> ('$$DATE')</code>' ;\
-	sed -i "s@$$SEARCH@$$REPLACE@g" index.html ;\
-	SEARCH='<script src="build/v86_all.js?[a-f0-9]\+"></script>' ;\
-	REPLACE='<script src="build/v86_all.js?'$$COMMIT'"></script>' ;\
-	sed -i "s@$$SEARCH@$$REPLACE@g" index.html ;\
-	grep $$COMMIT index.html
-
 
 $(CLOSURE):
 	mkdir -p $(CLOSURE_DIR)
@@ -314,6 +316,11 @@ nasmtests-force-jit: build/v86-debug.wasm
 	$(NASM_TEST_DIR)/create_tests.js
 	$(NASM_TEST_DIR)/gen_fixtures.js
 	$(NASM_TEST_DIR)/run.js --force-jit
+
+longmode-tests: build/v86-debug.wasm
+	./tests/longmode/run.js
+	JIT_THRESHOLD=1 ./tests/longmode/run.js
+	./tests/longmode/multiboot64.js
 
 jitpagingtests: build/v86-debug.wasm
 	$(MAKE) -C tests/jit-paging test-jit test-jit-smc
@@ -379,12 +386,19 @@ api-tests: build/v86-debug.wasm
 	#./tests/api/reboot-buildroot.js # https://github.com/copy/v86/issues/636
 	./tests/api/pic.js
 
-all-tests: eslint kvm-unit-test qemutests qemutests-release jitpagingtests api-tests nasmtests nasmtests-force-jit rust-test tests expect-tests
+# Guest RAM of 2 GiB (the largest size the site offers): boots buildroot and
+# allocates ~1.8 GiB inside the guest. Needs images/buildroot-bzimage68.bin.
+# The script prints "test finished" whatever Lua did, so the check is that Lua printed "ok".
+memory-2g-test: build/libv86.mjs build/v86.wasm
+	TEST_RELEASE_BUILD=1 timeout 900 ./tests/api/2g-mem.js 2>&1 | tee build/2g-mem.log
+	grep -q "Serial: ok$$" build/2g-mem.log
+
+all-tests: eslint kvm-unit-test qemutests qemutests-release jitpagingtests api-tests memory-2g-test nasmtests nasmtests-force-jit rust-test tests expect-tests
 	# Skipping:
 	# - devices-test (hangs)
 
 eslint:
-	eslint src tests gen lib examples tools
+	eslint src tests gen lib tools site
 
 rustfmt: $(RUST_FILES)
 	cargo fmt --all -- --check --config fn_single_line=true,control_brace_style=ClosingNextLine

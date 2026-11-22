@@ -1067,6 +1067,54 @@ V86.prototype.eject_cdrom = function()
 };
 
 /**
+ * Set the image inserted in the primary master hard disk drive. Can be changed
+ * at runtime, as when physically changing the hard disk. The new geometry is
+ * stored in the CMOS, so the machine picks the disk up on the next boot.
+ */
+V86.prototype.set_hda = async function(file)
+{
+    const ide = this.v86.cpu.devices.ide.primary.master;
+
+    if(file.url && !file.async)
+    {
+        await new Promise(resolve => {
+            load_file(file.url, {
+                done: result =>
+                {
+                    ide.set_disk_buffer(new SyncBuffer(result));
+                    resolve();
+                }
+            });
+        });
+    }
+    else
+    {
+        const image = buffer_from_object(file, this.zstd_decompress_worker.bind(this));
+        const loaded = new Promise(resolve => {
+            image.onload = () =>
+            {
+                // ide needs to read the mbr to calculate the device geometry
+                if(image.byteLength >= 512)
+                {
+                    image.get_and_cache(0, 512, () =>
+                    {
+                        ide.set_disk_buffer(image);
+                        resolve();
+                    });
+                }
+                else
+                {
+                    ide.set_disk_buffer(image);
+                    resolve();
+                }
+            };
+        });
+        await image.load();
+        await loaded;
+    }
+};
+
+/**
  * Send a sequence of scan codes to the emulated PS2 controller. A list of
  * codes can be found at http://stanislavs.org/helppc/make_codes.html.
  * Do nothing if there is no keyboard controller.
@@ -1162,7 +1210,14 @@ V86.prototype.screen_go_fullscreen = function()
 
     if(fn)
     {
-        fn.call(elem);
+        // A refused fullscreen request is not an error either: the page reports it in
+        // its own log, and an unhandled rejection would look like a broken machine
+        var started = fn.call(elem);
+
+        if(started && typeof started.catch === "function")
+        {
+            started.catch(function() {});
+        }
 
         // This is necessary, because otherwise chromium keyboard doesn't work anymore.
         // Might (but doesn't seem to) break something else
@@ -1171,30 +1226,61 @@ V86.prototype.screen_go_fullscreen = function()
     }
 
     try {
-        navigator.keyboard.lock();
+        navigator.keyboard && navigator.keyboard.lock();
     } catch(e) {}
 
-    this.lock_mouse();
+    // Grabbing the pointer hides the host cursor and keeps a relative mouse usable, but
+    // it needs a fresh user gesture, it is refused on touch devices and it would fight
+    // with the finger in touch mode, so it is only a bonus
+    var touch_mode = this.mouse_adapter && this.mouse_adapter.touch_mode;
+
+    if(!touch_mode && !this.absolute_pointer_enabled)
+    {
+        this.lock_mouse();
+    }
 };
 
 /**
  * Lock the mouse cursor: It becomes invisble and is not moved out of the
- * browser window.
+ * browser window. Never rejects: browsers refuse the request without a fresh user
+ * gesture (and phones do not support it at all), which is not an error.
+ *
+ * @return {Promise<boolean>} whether the pointer is locked now
  */
 V86.prototype.lock_mouse = async function()
 {
+    if(typeof document === "undefined" || !document.body)
+    {
+        return false;
+    }
+
     const elem = document.body;
+
+    if(!elem.requestPointerLock)
+    {
+        return false;
+    }
 
     try
     {
         await elem.requestPointerLock({
             unadjustedMovement: true,
         });
+        return !!document.pointerLockElement;
     }
     catch(e)
     {
-        // as per MDN, retry without unadjustedMovement option
+        // As per MDN, retry without the unadjustedMovement option
+    }
+
+    try
+    {
         await elem.requestPointerLock();
+        return !!document.pointerLockElement;
+    }
+    catch(e)
+    {
+        return false;
     }
 };
 
@@ -1212,6 +1298,48 @@ V86.prototype.mouse_set_enabled = function(enabled)
     }
 };
 V86.prototype.mouse_set_status = V86.prototype.mouse_set_enabled;
+
+/**
+ * Turn the guest pointer into a phone-like finger: one finger drags the pointer, a tap
+ * clicks, a long press is a right click and two fingers scroll. The host cursor is
+ * hidden while this is on, so only the guest's own pointer stays visible.
+ *
+ * @param {boolean} enabled
+ */
+V86.prototype.mouse_set_touch_mode = function(enabled)
+{
+    if(this.mouse_adapter)
+    {
+        this.mouse_adapter.set_touch_mode(enabled);
+    }
+};
+
+/**
+ * Click a mouse button at the current pointer position. Meant for the page's own
+ * on-screen buttons on a touch device.
+ *
+ * @param {number} button 1 = left, 2 = middle, 3 = right
+ */
+V86.prototype.mouse_click = function(button)
+{
+    if(this.mouse_adapter)
+    {
+        this.mouse_adapter.click(button);
+    }
+};
+
+/**
+ * Turn the guest wheel by the given number of notches, positive is up.
+ *
+ * @param {number} steps
+ */
+V86.prototype.mouse_scroll = function(steps)
+{
+    if(this.mouse_adapter)
+    {
+        this.mouse_adapter.scroll(steps);
+    }
+};
 
 /**
  * Enable or disable sending keyboard events to the emulated PS2 controller.

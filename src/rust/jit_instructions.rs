@@ -93,7 +93,7 @@ pub fn jit_handle_prefix(ctx: &mut JitContext, instr_flags: &mut u32) {
 
 pub fn jit_handle_segment_prefix(segment: u32, ctx: &mut JitContext, instr_flags: &mut u32) {
     dbg_assert!(segment <= 5);
-    ctx.cpu.prefixes = ctx.cpu.prefixes & !PREFIX_MASK_SEGMENT | (segment as u8 + 1);
+    ctx.cpu.prefixes = ctx.cpu.prefixes & !PREFIX_MASK_SEGMENT | (segment as u16 + 1);
     jit_handle_prefix(ctx, instr_flags)
 }
 
@@ -3558,7 +3558,8 @@ pub fn instr16_D9_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     let address_local = ctx.builder.set_new_local();
     codegen::gen_readable_or_pagefault(ctx, &address_local, 14);
     ctx.builder.get_local(&address_local);
-    ctx.builder.call_fn1("fpu_fldenv16");
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.call_fn1_i64("fpu_fldenv16");
     ctx.builder.free_local(address_local);
 }
 pub fn instr16_D9_4_reg_jit(ctx: &mut JitContext, r: u32) {
@@ -3576,7 +3577,8 @@ pub fn instr32_D9_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     let address_local = ctx.builder.set_new_local();
     codegen::gen_readable_or_pagefault(ctx, &address_local, 28);
     ctx.builder.get_local(&address_local);
-    ctx.builder.call_fn1("fpu_fldenv32");
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.call_fn1_i64("fpu_fldenv32");
     ctx.builder.free_local(address_local);
 }
 
@@ -3602,7 +3604,8 @@ pub fn instr16_D9_6_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     let address_local = ctx.builder.set_new_local();
     codegen::gen_writable_or_pagefault(ctx, &address_local, 14);
     ctx.builder.get_local(&address_local);
-    ctx.builder.call_fn1("fpu_fstenv16");
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.call_fn1_i64("fpu_fstenv16");
     ctx.builder.free_local(address_local);
 }
 pub fn instr16_D9_6_reg_jit(ctx: &mut JitContext, r: u32) {
@@ -3614,7 +3617,8 @@ pub fn instr32_D9_6_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     let address_local = ctx.builder.set_new_local();
     codegen::gen_writable_or_pagefault(ctx, &address_local, 28);
     ctx.builder.get_local(&address_local);
-    ctx.builder.call_fn1("fpu_fstenv32");
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.call_fn1_i64("fpu_fstenv32");
     ctx.builder.free_local(address_local);
 }
 
@@ -3749,7 +3753,8 @@ pub fn instr_DB_5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     let address_local = ctx.builder.set_new_local();
     codegen::gen_readable_or_pagefault(ctx, &address_local, 10);
     ctx.builder.get_local(&address_local);
-    ctx.builder.call_fn1("fpu_fldm80_without_fault");
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.call_fn1_i64("fpu_fldm80_without_fault");
     ctx.builder.free_local(address_local);
 }
 pub fn instr_DB_5_reg_jit(ctx: &mut JitContext, r: u32) {
@@ -4053,7 +4058,8 @@ pub fn instr_DF_6_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     let address_local = ctx.builder.set_new_local();
     codegen::gen_writable_or_pagefault(ctx, &address_local, 10);
     ctx.builder.get_local(&address_local);
-    ctx.builder.call_fn1("fpu_fbstp");
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.call_fn1_i64("fpu_fbstp");
     ctx.builder.free_local(address_local);
 }
 pub fn instr_DF_6_reg_jit(ctx: &mut JitContext, r: u32) {
@@ -7664,7 +7670,8 @@ pub fn instr_0FF7_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     ctx.builder.const_i32(r1 as i32);
     ctx.builder.const_i32(r2 as i32);
     ctx.builder.get_local(&address_local);
-    ctx.builder.call_fn3("maskmovq");
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.call_fn3_i32_i32_i64("maskmovq");
     ctx.builder.free_local(address_local);
 }
 
@@ -7764,7 +7771,8 @@ pub fn instr_660FF7_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     ctx.builder.const_i32(r1 as i32);
     ctx.builder.const_i32(r2 as i32);
     ctx.builder.get_local(&address_local);
-    ctx.builder.call_fn3("maskmovdqu");
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.call_fn3_i32_i32_i64("maskmovdqu");
     ctx.builder.free_local(address_local);
 }
 

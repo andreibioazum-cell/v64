@@ -122,32 +122,32 @@ pub unsafe fn i32_to_f80(v: i32) -> F80 { F80::of_i32(v) }
 pub unsafe fn i64_to_f80_jit(dst: *mut F80, v: i64) { *dst = i64_to_f80(v) }
 pub unsafe fn i64_to_f80(v: i64) -> F80 { F80::of_i64(v) }
 
-pub unsafe fn fpu_load_i16(addr: i32) -> OrPageFault<F80> {
+pub unsafe fn fpu_load_i16(addr: u64) -> OrPageFault<F80> {
     let v = safe_read16(addr)? as i16 as i32;
     Ok(F80::of_i32(v))
 }
-pub unsafe fn fpu_load_i32(addr: i32) -> OrPageFault<F80> {
+pub unsafe fn fpu_load_i32(addr: u64) -> OrPageFault<F80> {
     let v = safe_read32s(addr)?;
     Ok(F80::of_i32(v))
 }
-pub unsafe fn fpu_load_i64(addr: i32) -> OrPageFault<F80> {
+pub unsafe fn fpu_load_i64(addr: u64) -> OrPageFault<F80> {
     let v = safe_read64s(addr)? as i64;
     Ok(F80::of_i64(v))
 }
 
-pub unsafe fn fpu_load_m32(addr: i32) -> OrPageFault<F80> {
+pub unsafe fn fpu_load_m32(addr: u64) -> OrPageFault<F80> {
     F80::clear_exception_flags();
     let v = F80::of_f32(safe_read32s(addr)?);
     *fpu_status_word |= F80::get_exception_flags() as u16;
     Ok(v)
 }
-pub unsafe fn fpu_load_m64(addr: i32) -> OrPageFault<F80> {
+pub unsafe fn fpu_load_m64(addr: u64) -> OrPageFault<F80> {
     F80::clear_exception_flags();
     let v = F80::of_f64(safe_read64s(addr)?);
     *fpu_status_word |= F80::get_exception_flags() as u16;
     Ok(v)
 }
-pub unsafe fn fpu_load_m80(addr: i32) -> OrPageFault<F80> {
+pub unsafe fn fpu_load_m80(addr: u64) -> OrPageFault<F80> {
     let mantissa = safe_read64s(addr)?;
     let sign_exponent = safe_read16(addr + 8)? as u16;
     // TODO: Canonical form
@@ -251,9 +251,9 @@ pub unsafe fn fpu_fdivr(target_index: i32, val: F80) {
 #[no_mangle]
 pub unsafe fn fpu_ffree(r: i32) { *fpu_stack_empty |= 1 << (*fpu_stack_ptr as i32 + r & 7); }
 
-pub unsafe fn fpu_fildm16(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_i16(addr))); }
-pub unsafe fn fpu_fildm32(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_i32(addr))); }
-pub unsafe fn fpu_fildm64(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_i64(addr))); }
+pub unsafe fn fpu_fildm16(addr: u64) { fpu_push(return_on_pagefault!(fpu_load_i16(addr))); }
+pub unsafe fn fpu_fildm32(addr: u64) { fpu_push(return_on_pagefault!(fpu_load_i32(addr))); }
+pub unsafe fn fpu_fildm64(addr: u64) { fpu_push(return_on_pagefault!(fpu_load_i64(addr))); }
 
 #[no_mangle]
 pub unsafe fn fpu_push(x: F80) {
@@ -321,12 +321,12 @@ pub unsafe fn fpu_convert_to_i16(f: F80) -> i16 {
         st0 as i16
     }
 }
-pub unsafe fn fpu_fistm16(addr: i32) {
+pub unsafe fn fpu_fistm16(addr: u64) {
     return_on_pagefault!(writable_or_pagefault(addr, 2));
     let v = fpu_convert_to_i16(fpu_get_st0());
     safe_write16(addr, v as i32 & 0xFFFF).unwrap();
 }
-pub unsafe fn fpu_fistm16p(addr: i32) {
+pub unsafe fn fpu_fistm16p(addr: u64) {
     return_on_pagefault!(writable_or_pagefault(addr, 2));
     let v = fpu_convert_to_i16(fpu_get_st0());
     safe_write16(addr, v as i32 & 0xFFFF).unwrap();
@@ -343,7 +343,7 @@ pub unsafe fn fpu_truncate_to_i16(f: F80) -> i16 {
         st0 as i16
     }
 }
-pub unsafe fn fpu_fisttpm16(addr: i32) {
+pub unsafe fn fpu_fisttpm16(addr: u64) {
     return_on_pagefault!(writable_or_pagefault(addr, 2));
     let v = fpu_truncate_to_i16(fpu_get_st0());
     safe_write16(addr, v as i32 & 0xFFFF).unwrap();
@@ -357,12 +357,12 @@ pub unsafe fn fpu_convert_to_i32(f: F80) -> i32 {
     *fpu_status_word |= F80::get_exception_flags() as u16;
     x
 }
-pub unsafe fn fpu_fistm32(addr: i32) {
+pub unsafe fn fpu_fistm32(addr: u64) {
     return_on_pagefault!(writable_or_pagefault(addr, 4));
     let v = fpu_convert_to_i32(fpu_get_st0());
     safe_write32(addr, v).unwrap();
 }
-pub unsafe fn fpu_fistm32p(addr: i32) {
+pub unsafe fn fpu_fistm32p(addr: u64) {
     return_on_pagefault!(writable_or_pagefault(addr, 4));
     let v = fpu_convert_to_i32(fpu_get_st0());
     safe_write32(addr, v).unwrap();
@@ -375,7 +375,7 @@ pub unsafe fn fpu_truncate_to_i32(f: F80) -> i32 {
     *fpu_status_word |= F80::get_exception_flags() as u16;
     x
 }
-pub unsafe fn fpu_fisttpm32(addr: i32) {
+pub unsafe fn fpu_fisttpm32(addr: u64) {
     return_on_pagefault!(writable_or_pagefault(addr, 4));
     let v = fpu_truncate_to_i32(fpu_get_st0());
     safe_write32(addr, v).unwrap();
@@ -389,7 +389,7 @@ pub unsafe fn fpu_convert_to_i64(f: F80) -> i64 {
     *fpu_status_word |= F80::get_exception_flags() as u16;
     x
 }
-pub unsafe fn fpu_fistm64p(addr: i32) {
+pub unsafe fn fpu_fistm64p(addr: u64) {
     return_on_pagefault!(writable_or_pagefault(addr, 8));
     let v = fpu_convert_to_i64(fpu_get_st0());
     safe_write64(addr, v as u64).unwrap();
@@ -402,20 +402,20 @@ pub unsafe fn fpu_truncate_to_i64(f: F80) -> i64 {
     *fpu_status_word |= F80::get_exception_flags() as u16;
     x
 }
-pub unsafe fn fpu_fisttpm64(addr: i32) {
+pub unsafe fn fpu_fisttpm64(addr: u64) {
     return_on_pagefault!(writable_or_pagefault(addr, 8));
     let v = fpu_truncate_to_i64(fpu_get_st0());
     safe_write64(addr, v as u64).unwrap();
     fpu_pop();
 }
 
-pub unsafe fn fpu_fldcw(addr: i32) {
+pub unsafe fn fpu_fldcw(addr: u64) {
     let word = return_on_pagefault!(safe_read16(addr)) as u16;
     set_control_word(word);
 }
 
 #[no_mangle]
-pub unsafe fn fpu_fldenv16(addr: i32) {
+pub unsafe fn fpu_fldenv16(addr: u64) {
     // protected-mode layout (the real-mode layout stores the linear ip/dp)
     set_control_word(safe_read16(addr).unwrap() as u16);
     fpu_set_status_word(safe_read16(addr + 2).unwrap() as u16);
@@ -426,7 +426,7 @@ pub unsafe fn fpu_fldenv16(addr: i32) {
     *fpu_dp_selector = safe_read16(addr + 12).unwrap()
 }
 #[no_mangle]
-pub unsafe fn fpu_fldenv32(addr: i32) {
+pub unsafe fn fpu_fldenv32(addr: u64) {
     // protected-mode layout (the real-mode layout stores the linear ip/dp)
     set_control_word(safe_read16(addr).unwrap() as u16);
     fpu_set_status_word(safe_read16(addr + 4).unwrap() as u16);
@@ -453,18 +453,18 @@ pub unsafe fn fpu_set_status_word(sw: u16) {
     *fpu_stack_ptr = (sw >> 11 & 7) as u8;
 }
 
-pub unsafe fn fpu_fldm32(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m32(addr))); }
-pub unsafe fn fpu_fldm64(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m64(addr))); }
-pub unsafe fn fpu_fldm80(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m80(addr))); }
+pub unsafe fn fpu_fldm32(addr: u64) { fpu_push(return_on_pagefault!(fpu_load_m32(addr))); }
+pub unsafe fn fpu_fldm64(addr: u64) { fpu_push(return_on_pagefault!(fpu_load_m64(addr))); }
+pub unsafe fn fpu_fldm80(addr: u64) { fpu_push(return_on_pagefault!(fpu_load_m80(addr))); }
 #[no_mangle]
-pub unsafe fn fpu_fldm80_without_fault(addr: i32) { fpu_push(fpu_load_m80(addr).unwrap()); }
+pub unsafe fn fpu_fldm80_without_fault(addr: u64) { fpu_push(fpu_load_m80(addr).unwrap()); }
 
 #[no_mangle]
 pub unsafe fn fpu_fmul(target_index: i32, val: F80) {
     let st0 = fpu_get_st0();
     fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, st0 * val);
 }
-pub unsafe fn fpu_fnstsw_mem(addr: i32) {
+pub unsafe fn fpu_fnstsw_mem(addr: u64) {
     return_on_pagefault!(safe_write16(addr, fpu_load_status_word().into()));
 }
 pub unsafe fn fpu_fnstsw_reg() { write_reg16(AX, fpu_load_status_word().into()); }
@@ -518,11 +518,11 @@ pub unsafe fn fpu_fprem(ieee: bool) {
     }
 }
 
-pub unsafe fn fpu_frstor16(_addr: i32) {
+pub unsafe fn fpu_frstor16(_addr: u64) {
     dbg_log!("frstor16");
     fpu_unimpl();
 }
-pub unsafe fn fpu_frstor32(mut addr: i32) {
+pub unsafe fn fpu_frstor32(mut addr: u64) {
     return_on_pagefault!(readable_or_pagefault(addr, 28 + 8 * 10));
     fpu_fldenv32(addr);
     addr += 28;
@@ -533,11 +533,11 @@ pub unsafe fn fpu_frstor32(mut addr: i32) {
     }
 }
 
-pub unsafe fn fpu_fsave16(_addr: i32) {
+pub unsafe fn fpu_fsave16(_addr: u64) {
     dbg_log!("fsave16");
     fpu_unimpl();
 }
-pub unsafe fn fpu_fsave32(mut addr: i32) {
+pub unsafe fn fpu_fsave32(mut addr: u64) {
     return_on_pagefault!(writable_or_pagefault(addr, 108));
     fpu_fstenv32(addr);
     addr += 28;
@@ -549,14 +549,14 @@ pub unsafe fn fpu_fsave32(mut addr: i32) {
     fpu_finit();
 }
 
-pub unsafe fn fpu_store_m80(addr: i32, f: F80) {
+pub unsafe fn fpu_store_m80(addr: u64, f: F80) {
     // writable_or_pagefault must have checked called by the caller!
     safe_write64(addr, f.mantissa).unwrap();
     safe_write16(addr + 8, f.sign_exponent as i32).unwrap();
 }
 
 #[no_mangle]
-pub unsafe fn fpu_fstenv16(addr: i32) {
+pub unsafe fn fpu_fstenv16(addr: u64) {
     safe_write16(addr + 0, *fpu_control_word as i32).unwrap();
     safe_write16(addr + 2, fpu_load_status_word() as i32).unwrap();
     safe_write16(addr + 4, fpu_load_tag_word()).unwrap();
@@ -567,7 +567,7 @@ pub unsafe fn fpu_fstenv16(addr: i32) {
 }
 
 #[no_mangle]
-pub unsafe fn fpu_fstenv32(addr: i32) {
+pub unsafe fn fpu_fstenv32(addr: u64) {
     let high_bits = 0xFFFF0000u32 as i32;
     safe_write32(addr + 0, high_bits + *fpu_control_word as i32).unwrap();
     safe_write32(addr + 4, high_bits + fpu_load_status_word() as i32).unwrap();
@@ -603,34 +603,34 @@ pub unsafe fn fpu_fst(r: i32) {
         *fpu_stack_empty &= !(1 << index);
     }
 }
-pub unsafe fn fpu_fst80p(addr: i32) {
+pub unsafe fn fpu_fst80p(addr: u64) {
     return_on_pagefault!(writable_or_pagefault(addr, 10));
     fpu_store_m80(addr, fpu_get_st0());
     fpu_pop();
 }
 
-pub unsafe fn fpu_fstcw(addr: i32) {
+pub unsafe fn fpu_fstcw(addr: u64) {
     return_on_pagefault!(safe_write16(addr, (*fpu_control_word).into()));
 }
 
-pub unsafe fn fpu_fstm32(addr: i32) {
+pub unsafe fn fpu_fstm32(addr: u64) {
     return_on_pagefault!(fpu_store_m32(addr, fpu_get_st0()));
 }
-pub unsafe fn fpu_store_m32(addr: i32, x: F80) -> OrPageFault<()> {
+pub unsafe fn fpu_store_m32(addr: u64, x: F80) -> OrPageFault<()> {
     F80::clear_exception_flags();
     safe_write32(addr, x.to_f32())?;
     *fpu_status_word |= F80::get_exception_flags() as u16;
     Ok(())
 }
-pub unsafe fn fpu_fstm32p(addr: i32) {
+pub unsafe fn fpu_fstm32p(addr: u64) {
     return_on_pagefault!(fpu_store_m32(addr, fpu_get_st0()));
     fpu_pop();
 }
-pub unsafe fn fpu_fstm64(addr: i32) {
+pub unsafe fn fpu_fstm64(addr: u64) {
     return_on_pagefault!(fpu_store_m64(addr, fpu_get_st0()));
 }
-pub unsafe fn fpu_store_m64(addr: i32, x: F80) -> OrPageFault<()> { safe_write64(addr, x.to_f64()) }
-pub unsafe fn fpu_fstm64p(addr: i32) {
+pub unsafe fn fpu_store_m64(addr: u64, x: F80) -> OrPageFault<()> { safe_write64(addr, x.to_f64()) }
+pub unsafe fn fpu_fstm64p(addr: u64) {
     // XXX: writable_or_pagefault before get_st0
     return_on_pagefault!(fpu_store_m64(addr, fpu_get_st0()));
     fpu_pop();
@@ -642,7 +642,7 @@ pub unsafe fn fpu_fstp(r: i32) {
 }
 
 #[no_mangle]
-pub unsafe fn fpu_fbstp(addr: i32) {
+pub unsafe fn fpu_fbstp(addr: u64) {
     let st0 = fpu_get_st0();
     let mut x = st0.to_i64().unsigned_abs();
     if x <= 99_9999_9999_9999_9999 {
