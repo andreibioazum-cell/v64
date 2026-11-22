@@ -109,6 +109,35 @@ button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accen
     cursor: none !important;
 }
 
+/* Кнопки сенсорного режима: крошечные, поверх экрана, не мешают картинке */
+#touch_bar {
+    position: absolute;
+    right: 6px;
+    bottom: 6px;
+    display: flex;
+    gap: 3px;
+    z-index: 5;
+    opacity: .82;
+}
+#touch_bar[hidden] { display: none; }
+#touch_bar button {
+    min-height: 0;
+    min-width: 24px;
+    height: 22px;
+    padding: 0 4px;
+    font: 10px/1 system-ui, sans-serif;
+    border-radius: 5px;
+    border: 1px solid rgba(255, 255, 255, .35);
+    background: rgba(20, 22, 26, .72);
+    color: #e9e9ea;
+    cursor: pointer;
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+}
+#touch_bar button:active { background: var(--accent); border-color: var(--accent); }
+#touch_bar button:disabled { opacity: .35; }
+
 /* На весь экран: экран виден целиком, без обрезки снизу, по центру */
 #screen_container:fullscreen {
     display: flex;
@@ -245,13 +274,20 @@ button:focus-visible, .file_button:focus-within { outline: 2px solid var(--accen
 <body>
 <header>
     <h1>v86 · x86-64</h1>
-    <p class="hint">Эмулятор ПК в браузере. Выберите ISO-образ (например, Alpine Linux x86_64) или образ жёсткого диска (образ раздела/диска целиком, .img/.raw) и запустите. Если выбраны оба, при запуске загрузка идёт с жёсткого диска. На телефоне или планшете включите «Сенсорный режим» — палец будет вести курсор, касание станет кликом. Если загрузка не удалась, причина будет в логе под экраном.</p>
+    <p class="hint">Эмулятор ПК в браузере. Выберите ISO-образ (например, Alpine Linux x86_64) или образ жёсткого диска (образ раздела/диска целиком, .img/.raw) и запустите. Если выбраны оба, при запуске загрузка идёт с жёсткого диска. На телефоне или планшете включите «Сенсорный режим» — палец будет вести курсор, касание станет кликом, а в углу экрана появятся крошечные кнопки ЛКМ, ПКМ, прокрутки и клавиатуры. Если загрузка не удалась, причина будет в логе под экраном.</p>
 </header>
 
 <main>
     <div id="screen_container">
         <div style="white-space: pre; font: 14px monospace; line-height: 14px"></div>
         <canvas style="display: none"></canvas>
+        <div id="touch_bar" data-host-ui hidden>
+            <button type="button" id="touch_lmb" title="Левая кнопка мыши" aria-label="Левая кнопка мыши">ЛКМ</button>
+            <button type="button" id="touch_rmb" title="Правая кнопка мыши" aria-label="Правая кнопка мыши">ПКМ</button>
+            <button type="button" id="touch_wheel_up" title="Прокрутка вверх" aria-label="Прокрутка вверх">▲</button>
+            <button type="button" id="touch_wheel_down" title="Прокрутка вниз" aria-label="Прокрутка вниз">▼</button>
+            <button type="button" id="touch_keyboard" title="Клавиатура: ввод текста в гостя" aria-label="Клавиатура">⌨</button>
+        </div>
     </div>
 
     <div id="controls">

@@ -42,6 +42,12 @@
     var progress_label_el = el("progress_label");
     var touch_input = el("touch");
     var touch_label = el("touch_label");
+    var touch_bar = el("touch_bar");
+    var touch_lmb_btn = el("touch_lmb");
+    var touch_rmb_btn = el("touch_rmb");
+    var touch_wheel_up_btn = el("touch_wheel_up");
+    var touch_wheel_down_btn = el("touch_wheel_down");
+    var touch_keyboard_btn = el("touch_keyboard");
 
     function decode_base64(b64)
     {
@@ -127,6 +133,44 @@
         if(screen_container)
         {
             screen_container.classList.toggle("touch_mode", on);
+        }
+        if(touch_bar)
+        {
+            // The bar only makes sense with the finger mode, and only once there is a
+            // machine to click into
+            touch_bar.hidden = !on;
+        }
+        update_touch_bar();
+    }
+
+    // The small buttons over the screen: left, right, wheel, keyboard
+    function update_touch_bar()
+    {
+        var ready = !!(emulator && !paused);
+
+        [touch_lmb_btn, touch_rmb_btn, touch_wheel_up_btn, touch_wheel_down_btn, touch_keyboard_btn]
+            .forEach(function(button)
+            {
+                if(button)
+                {
+                    button.disabled = !ready;
+                }
+            });
+    }
+
+    function touch_click(button)
+    {
+        if(emulator && typeof emulator.mouse_click === "function")
+        {
+            emulator.mouse_click(button);
+        }
+    }
+
+    function touch_scroll(steps)
+    {
+        if(emulator && typeof emulator.mouse_scroll === "function")
+        {
+            emulator.mouse_scroll(steps);
         }
     }
 
@@ -1114,6 +1158,7 @@
         cad_btn.disabled = !running;
         fullscreen_btn.disabled = !running;
         typing.disabled = !running;
+        update_touch_bar();
         pause_btn.textContent = paused ? "Продолжить" : "Пауза";
     }
 
@@ -1320,6 +1365,9 @@
             screen_container: el("screen_container"),
             memory_size: ram_mib * MiB,
             vga_memory_size: 8 * MiB,
+            // A real PC has ACPI tables: guests then find an RSDP, use the ACPI timer and
+            // can power themselves off instead of only halting
+            acpi: true,
             bios: { buffer: seabios.buffer },
             vga_bios: { buffer: vgabios.buffer },
             // The hard disk goes first in the boot order when it is present; the
@@ -1472,6 +1520,86 @@
     if(touch_input)
     {
         touch_input.addEventListener("change", apply_touch_mode);
+    }
+
+    if(touch_lmb_btn)
+    {
+        touch_lmb_btn.addEventListener("click", function()
+        {
+            touch_click(1);
+        });
+    }
+
+    if(touch_rmb_btn)
+    {
+        touch_rmb_btn.addEventListener("click", function()
+        {
+            touch_click(3);
+        });
+    }
+
+    // A tap scrolls one notch, holding the button keeps scrolling
+    function bind_wheel(button, steps)
+    {
+        if(!button)
+        {
+            return;
+        }
+
+        var hold_timer = 0;
+        var repeat_timer = 0;
+        var scrolled = false;
+
+        function stop()
+        {
+            clearTimeout(hold_timer);
+            clearInterval(repeat_timer);
+            hold_timer = 0;
+            repeat_timer = 0;
+        }
+
+        button.addEventListener("pointerdown", function()
+        {
+            stop();
+            scrolled = false;
+            hold_timer = setTimeout(function()
+            {
+                hold_timer = 0;
+                scrolled = true;
+                touch_scroll(steps);
+                repeat_timer = setInterval(function()
+                {
+                    touch_scroll(steps);
+                }, 140);
+            }, 300);
+        });
+
+        button.addEventListener("pointerup", stop);
+        button.addEventListener("pointercancel", stop);
+        button.addEventListener("pointerleave", stop);
+
+        // A short tap, the keyboard, or a browser without pointer events
+        button.addEventListener("click", function()
+        {
+            if(!scrolled)
+            {
+                touch_scroll(steps);
+            }
+            scrolled = false;
+        });
+    }
+
+    bind_wheel(touch_wheel_up_btn, 1);
+    bind_wheel(touch_wheel_down_btn, -1);
+
+    if(touch_keyboard_btn)
+    {
+        touch_keyboard_btn.addEventListener("click", function()
+        {
+            // The click is the user gesture a phone needs to open its keyboard
+            typing.focus();
+            set_status("Ввод: наберите текст в поле ниже — он уйдёт в гостя.");
+        });
     }
 
     if(iso_clear_btn)

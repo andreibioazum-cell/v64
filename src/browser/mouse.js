@@ -107,6 +107,30 @@ export function MouseAdapter(bus, screen_container)
         mouse.update_cursor();
     };
 
+    /**
+     * Click a button at the current pointer position. The page uses this for its own
+     * on-screen buttons on a touch device.
+     *
+     * @param {number} which 1 = left, 2 = middle, 3 = right
+     */
+    this.click = function(which)
+    {
+        click_button(which === 2 ? 2 : which === 3 ? 3 : 1);
+    };
+
+    /**
+     * Turn the guest wheel by the given number of notches, positive is up.
+     *
+     * @param {number} steps
+     */
+    this.scroll = function(steps)
+    {
+        if(steps)
+        {
+            mouse.bus.send("mouse-wheel", [steps, 0]);
+        }
+    };
+
     this.destroy = function()
     {
         if(typeof window === "undefined")
@@ -216,6 +240,12 @@ export function MouseAdapter(bus, screen_container)
             return false;
         }
 
+        // The page's own buttons over the screen are not the guest's
+        if(is_host_ui(e.target))
+        {
+            return false;
+        }
+
         const MOVE_MOUSE_WHEN_OVER_SCREEN_ONLY = true;
 
         if(MOVE_MOUSE_WHEN_OVER_SCREEN_ONLY)
@@ -270,12 +300,29 @@ export function MouseAdapter(bus, screen_container)
 
     // Touch mode ---------------------------------------------------------------
 
+    // Elements marked with data-host-ui (the page's own buttons over the screen) belong
+    // to the page, not to the guest.
+    function is_host_ui(node)
+    {
+        var element = node && node.nodeType === 1 ? node : (node && node.parentElement);
+
+        while(element && element !== screen_container)
+        {
+            if(element.hasAttribute && element.hasAttribute("data-host-ui"))
+            {
+                return true;
+            }
+            element = element.parentElement;
+        }
+        return false;
+    }
+
     // Only touches on the screen itself belong to the guest; the rest of the page keeps
     // scrolling normally.
     function touch_on_screen(e)
     {
         const parent = screen_container || document.body;
-        return is_child(e.target, parent);
+        return is_child(e.target, parent) && !is_host_ui(e.target);
     }
 
     // Guests with an absolute pointing device follow this directly, so a tap lands
@@ -415,23 +462,30 @@ export function MouseAdapter(bus, screen_container)
         release_buttons();
     }
 
-    // Press and release in quick succession, so the guest sees a real click
-    function touch_click(right)
+    // Press and release in quick succession, so the guest sees a real click.
+    // which: 1 = left, 2 = middle, 3 = right
+    function click_button(which)
     {
-        left_down = !right;
-        right_down = !!right;
-        middle_down = false;
-        mouse.bus.send("mouse-click", [left_down, middle_down, right_down]);
-
         if(touch_click_timer)
         {
             clearTimeout(touch_click_timer);
         }
+
+        left_down = which === 1;
+        middle_down = which === 2;
+        right_down = which === 3;
+        mouse.bus.send("mouse-click", [left_down, middle_down, right_down]);
+
         touch_click_timer = setTimeout(function()
         {
             touch_click_timer = 0;
             release_buttons();
         }, TOUCH_CLICK_TIME);
+    }
+
+    function touch_click(right)
+    {
+        click_button(right ? 3 : 1);
     }
 
     function mousemove_handler(e)

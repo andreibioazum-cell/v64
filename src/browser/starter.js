@@ -1315,6 +1315,33 @@ V86.prototype.mouse_set_touch_mode = function(enabled)
 };
 
 /**
+ * Click a mouse button at the current pointer position. Meant for the page's own
+ * on-screen buttons on a touch device.
+ *
+ * @param {number} button 1 = left, 2 = middle, 3 = right
+ */
+V86.prototype.mouse_click = function(button)
+{
+    if(this.mouse_adapter)
+    {
+        this.mouse_adapter.click(button);
+    }
+};
+
+/**
+ * Turn the guest wheel by the given number of notches, positive is up.
+ *
+ * @param {number} steps
+ */
+V86.prototype.mouse_scroll = function(steps)
+{
+    if(this.mouse_adapter)
+    {
+        this.mouse_adapter.scroll(steps);
+    }
+};
+
+/**
  * Enable or disable sending keyboard events to the emulated PS2 controller.
  *
  * @param {boolean} enabled

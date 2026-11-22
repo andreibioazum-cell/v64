@@ -792,6 +792,17 @@ export class V86 {
     mouse_set_touch_mode(enabled: boolean): void;
 
     /**
+     * Click a mouse button at the current pointer position (for on-screen buttons).
+     * 1 = left, 2 = middle, 3 = right.
+     */
+    mouse_click(button: number): void;
+
+    /**
+     * Turn the guest wheel by the given number of notches, positive is up.
+     */
+    mouse_scroll(steps: number): void;
+
+    /**
      * Enable or disable sending keyboard events to the emulated PS2 controller.
      */
     keyboard_set_enabled(enabled: boolean): void;
